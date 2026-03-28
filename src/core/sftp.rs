@@ -74,7 +74,44 @@ impl SftpConnection {
                     .await?
             }
             AuthMethod::Agent => {
-                return Err("SSH agent auth not yet implemented".into());
+                let mut agent = russh::keys::agent::client::AgentClient::connect_env().await
+                    .map_err(|e| format!("Failed to connect to SSH agent: {}", e))?;
+
+                let identities = agent.request_identities().await
+                    .map_err(|e| format!("Failed to list agent keys: {}", e))?;
+
+                let mut authenticated = false;
+                for identity in &identities {
+                    let pubkey = match identity {
+                        russh::keys::agent::AgentIdentity::PublicKey { key, .. } => key.clone(),
+                        russh::keys::agent::AgentIdentity::Certificate { certificate: _, .. } => {
+                            continue; // skip certs for now
+                        }
+                    };
+                    let result = handle.authenticate_publickey_with(
+                        username,
+                        pubkey,
+                        None,
+                        &mut agent,
+                    ).await;
+                    match result {
+                        Ok(r) if r.success() => {
+                            authenticated = true;
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+                if !authenticated {
+                    return Err("SSH agent: no accepted key found".into());
+                }
+                // Skip the auth_result check below
+                return {
+                    let channel = handle.channel_open_session().await?;
+                    channel.request_subsystem(true, "sftp").await?;
+                    let sftp = SftpSession::new(channel.into_stream()).await?;
+                    Ok(Self { sftp, _handle: handle })
+                };
             }
         };
 
@@ -200,6 +237,39 @@ impl SftpConnection {
             done: true,
         });
 
+        Ok(())
+    }
+
+    pub async fn mkdir(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.sftp.create_dir(path).await?;
+        Ok(())
+    }
+
+    pub async fn remove_file(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.sftp.remove_file(path).await?;
+        Ok(())
+    }
+
+    pub async fn remove_dir(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.sftp.remove_dir(path).await?;
+        Ok(())
+    }
+
+    pub async fn rename(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.sftp.rename(from, to).await?;
         Ok(())
     }
 

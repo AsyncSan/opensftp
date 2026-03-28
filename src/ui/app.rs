@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use iced::widget::{button, column, container, horizontal_rule, progress_bar, row, text};
-use iced::{Element, Length, Task, Theme};
+use iced::keyboard::{self, Key, Modifiers};
+use iced::widget::{button, column, container, horizontal_rule, progress_bar, row, text, text_input};
+use iced::{Element, Length, Subscription, Task, Theme};
 use iced::futures::stream;
 use tokio::sync::mpsc;
 
@@ -37,6 +38,22 @@ pub enum Message {
     TransferProgress(TransferProgress),
     TransferComplete(String),
     TransferFailed(String),
+    // Remote operations
+    RemoteMkdir,
+    MkdirNameChanged(String),
+    MkdirConfirm,
+    MkdirCancel,
+    RemoteDelete,
+    DeleteConfirm,
+    DeleteCancel,
+    RemoteRename,
+    RenameNameChanged(String),
+    RenameConfirm,
+    RenameCancel,
+    RemoteOpDone(String),
+    RemoteOpFailed(String),
+    // Keyboard
+    KeyPressed(Key, Modifiers),
 }
 
 impl std::fmt::Debug for Message {
@@ -57,6 +74,20 @@ impl std::fmt::Debug for Message {
             Self::TransferProgress(p) => write!(f, "Progress({}/{})", p.transferred, p.total_size),
             Self::TransferComplete(s) => write!(f, "TransferComplete({})", s),
             Self::TransferFailed(e) => write!(f, "TransferFailed({})", e),
+            Self::RemoteMkdir => write!(f, "RemoteMkdir"),
+            Self::MkdirNameChanged(n) => write!(f, "MkdirNameChanged({})", n),
+            Self::MkdirConfirm => write!(f, "MkdirConfirm"),
+            Self::MkdirCancel => write!(f, "MkdirCancel"),
+            Self::RemoteDelete => write!(f, "RemoteDelete"),
+            Self::DeleteConfirm => write!(f, "DeleteConfirm"),
+            Self::DeleteCancel => write!(f, "DeleteCancel"),
+            Self::RemoteRename => write!(f, "RemoteRename"),
+            Self::RenameNameChanged(n) => write!(f, "RenameNameChanged({})", n),
+            Self::RenameConfirm => write!(f, "RenameConfirm"),
+            Self::RenameCancel => write!(f, "RenameCancel"),
+            Self::RemoteOpDone(s) => write!(f, "RemoteOpDone({})", s),
+            Self::RemoteOpFailed(e) => write!(f, "RemoteOpFailed({})", e),
+            Self::KeyPressed(k, m) => write!(f, "KeyPressed({:?}, {:?})", k, m),
         }
     }
 }
@@ -66,6 +97,20 @@ enum Screen {
     Connect,
     Connecting,
     Browser,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivePanel {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Dialog {
+    None,
+    Mkdir(String),
+    ConfirmDelete(String),
+    Rename(String, String), // (old_name, new_name)
 }
 
 pub struct App {
@@ -84,6 +129,9 @@ pub struct App {
     transfer_active: bool,
     transfer_progress: f32,
     transfer_status: String,
+    // UI state
+    active_panel: ActivePanel,
+    dialog: Dialog,
 }
 
 impl Default for App {
@@ -109,6 +157,8 @@ impl Default for App {
             transfer_active: false,
             transfer_progress: 0.0,
             transfer_status: String::new(),
+            active_panel: ActivePanel::Local,
+            dialog: Dialog::None,
         }
     }
 }
@@ -514,6 +564,179 @@ impl App {
                 let idx = themes.iter().position(|t| *t == self.theme).unwrap_or(0);
                 self.theme = themes[(idx + 1) % themes.len()];
             }
+
+            // Remote operations
+            Message::RemoteMkdir => {
+                if self.screen == Screen::Browser {
+                    self.dialog = Dialog::Mkdir(String::new());
+                }
+            }
+            Message::MkdirNameChanged(name) => {
+                if let Dialog::Mkdir(ref mut n) = self.dialog {
+                    *n = name;
+                }
+            }
+            Message::MkdirConfirm => {
+                if let Dialog::Mkdir(ref name) = self.dialog {
+                    if !name.is_empty() {
+                        if let Some(conn) = self.sftp.clone() {
+                            let path = format!("{}/{}", self.remote_path, name);
+                            let refresh_path = self.remote_path.clone();
+                            self.dialog = Dialog::None;
+                            return Task::perform(
+                                async move {
+                                    conn.mkdir(&path).await?;
+                                    let entries = conn.list_dir(&refresh_path).await?;
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, refresh_path))
+                                },
+                                |result| match result {
+                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                    Err(e) => Message::RemoteOpFailed(e.to_string()),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Message::MkdirCancel => {
+                self.dialog = Dialog::None;
+            }
+            Message::RemoteDelete => {
+                if self.screen == Screen::Browser {
+                    if let Some(idx) = self.remote_selected {
+                        if let Some(entry) = self.remote_entries.get(idx) {
+                            if entry.name != ".." {
+                                self.dialog = Dialog::ConfirmDelete(entry.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Message::DeleteConfirm => {
+                if let Dialog::ConfirmDelete(ref name) = self.dialog {
+                    if let Some(conn) = self.sftp.clone() {
+                        let is_dir = self.remote_entries.iter()
+                            .find(|e| e.name == *name)
+                            .map_or(false, |e| e.is_dir);
+                        let path = format!("{}/{}", self.remote_path, name);
+                        let refresh_path = self.remote_path.clone();
+                        self.dialog = Dialog::None;
+                        self.remote_selected = None;
+                        return Task::perform(
+                            async move {
+                                if is_dir {
+                                    conn.remove_dir(&path).await?;
+                                } else {
+                                    conn.remove_file(&path).await?;
+                                }
+                                let entries = conn.list_dir(&refresh_path).await?;
+                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, refresh_path))
+                            },
+                            |result| match result {
+                                Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                Err(e) => Message::RemoteOpFailed(e.to_string()),
+                            },
+                        );
+                    }
+                }
+            }
+            Message::DeleteCancel => {
+                self.dialog = Dialog::None;
+            }
+            Message::RemoteRename => {
+                if self.screen == Screen::Browser {
+                    if let Some(idx) = self.remote_selected {
+                        if let Some(entry) = self.remote_entries.get(idx) {
+                            if entry.name != ".." {
+                                self.dialog = Dialog::Rename(entry.name.clone(), entry.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Message::RenameNameChanged(name) => {
+                if let Dialog::Rename(_, ref mut new) = self.dialog {
+                    *new = name;
+                }
+            }
+            Message::RenameConfirm => {
+                if let Dialog::Rename(ref old, ref new) = self.dialog {
+                    if !new.is_empty() && old != new {
+                        if let Some(conn) = self.sftp.clone() {
+                            let from = format!("{}/{}", self.remote_path, old);
+                            let to = format!("{}/{}", self.remote_path, new);
+                            let refresh_path = self.remote_path.clone();
+                            self.dialog = Dialog::None;
+                            return Task::perform(
+                                async move {
+                                    conn.rename(&from, &to).await?;
+                                    let entries = conn.list_dir(&refresh_path).await?;
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, refresh_path))
+                                },
+                                |result| match result {
+                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                    Err(e) => Message::RemoteOpFailed(e.to_string()),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Message::RenameCancel => {
+                self.dialog = Dialog::None;
+            }
+            Message::RemoteOpDone(msg) => {
+                self.status = msg;
+            }
+            Message::RemoteOpFailed(err) => {
+                self.status = format!("Error: {}", err);
+            }
+
+            // Keyboard shortcuts
+            Message::KeyPressed(key, _modifiers) => {
+                if self.dialog != Dialog::None {
+                    // Don't handle shortcuts when a dialog is open
+                    return Task::none();
+                }
+                if self.screen != Screen::Browser {
+                    return Task::none();
+                }
+                match key {
+                    Key::Named(keyboard::key::Named::F5) => {
+                        // Refresh both panels
+                        self.local_entries = read_local_dir(&self.local_path);
+                        if let Some(conn) = self.sftp.clone() {
+                            let path = self.remote_path.clone();
+                            return Task::perform(
+                                async move {
+                                    let entries = conn.list_dir(&path).await?;
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, path))
+                                },
+                                |result| match result {
+                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                    Err(e) => Message::RemoteListingFailed(e.to_string()),
+                                },
+                            );
+                        }
+                    }
+                    Key::Named(keyboard::key::Named::Delete) => {
+                        return self.update(Message::RemoteDelete);
+                    }
+                    Key::Named(keyboard::key::Named::F2) => {
+                        return self.update(Message::RemoteRename);
+                    }
+                    Key::Named(keyboard::key::Named::F7) => {
+                        return self.update(Message::RemoteMkdir);
+                    }
+                    Key::Named(keyboard::key::Named::Tab) => {
+                        self.active_panel = match self.active_panel {
+                            ActivePanel::Local => ActivePanel::Remote,
+                            ActivePanel::Remote => ActivePanel::Local,
+                        };
+                    }
+                    _ => {}
+                }
+            }
         }
         Task::none()
     }
@@ -554,9 +777,24 @@ impl App {
                 .into()
             }
             Screen::Browser => {
+                let has_remote_selection = self.remote_selected.is_some()
+                    && self.remote_entries.get(self.remote_selected.unwrap_or(0))
+                        .map_or(false, |e| e.name != "..");
+
                 let toolbar = row![
                     text(&self.status).size(13),
                     iced::widget::horizontal_space(),
+                    button("F7 Mkdir").on_press(Message::RemoteMkdir).padding(4),
+                    {
+                        let mut btn = button("F2 Rename").padding(4);
+                        if has_remote_selection { btn = btn.on_press(Message::RemoteRename); }
+                        btn
+                    },
+                    {
+                        let mut btn = button("Del").padding(4);
+                        if has_remote_selection { btn = btn.on_press(Message::RemoteDelete); }
+                        btn
+                    },
                     button(self.theme.name())
                         .on_press(Message::CycleTheme)
                         .padding(4),
@@ -635,19 +873,109 @@ impl App {
                     container(text("")).width(Length::Fill).into()
                 };
 
-                container(
-                    column![toolbar, horizontal_rule(1), panels, transfer_bar]
-                        .spacing(0),
-                )
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+                // Dialog overlay
+                let content: Element<'_, Message> = match &self.dialog {
+                    Dialog::None => {
+                        column![toolbar, horizontal_rule(1), panels, transfer_bar]
+                            .spacing(0)
+                            .into()
+                    }
+                    Dialog::Mkdir(name) => {
+                        let dialog = container(
+                            column![
+                                text("New Directory").size(16),
+                                text_input("Directory name", name)
+                                    .on_input(Message::MkdirNameChanged)
+                                    .on_submit(Message::MkdirConfirm)
+                                    .padding(8),
+                                row![
+                                    button("Cancel").on_press(Message::MkdirCancel).padding(6),
+                                    button("Create").on_press(Message::MkdirConfirm).padding(6),
+                                ]
+                                .spacing(12),
+                            ]
+                            .spacing(12)
+                            .max_width(300),
+                        )
+                        .padding(20)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill);
+
+                        iced::widget::stack![
+                            column![toolbar, horizontal_rule(1), panels, transfer_bar].spacing(0),
+                            dialog,
+                        ]
+                        .into()
+                    }
+                    Dialog::ConfirmDelete(name) => {
+                        let dialog = container(
+                            column![
+                                text("Delete").size(16),
+                                text(format!("Delete \"{}\"?", name)).size(14),
+                                row![
+                                    button("Cancel").on_press(Message::DeleteCancel).padding(6),
+                                    button("Delete").on_press(Message::DeleteConfirm).padding(6),
+                                ]
+                                .spacing(12),
+                            ]
+                            .spacing(12)
+                            .max_width(300),
+                        )
+                        .padding(20)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill);
+
+                        iced::widget::stack![
+                            column![toolbar, horizontal_rule(1), panels, transfer_bar].spacing(0),
+                            dialog,
+                        ]
+                        .into()
+                    }
+                    Dialog::Rename(old, new) => {
+                        let dialog = container(
+                            column![
+                                text(format!("Rename \"{}\"", old)).size(16),
+                                text_input("New name", new)
+                                    .on_input(Message::RenameNameChanged)
+                                    .on_submit(Message::RenameConfirm)
+                                    .padding(8),
+                                row![
+                                    button("Cancel").on_press(Message::RenameCancel).padding(6),
+                                    button("Rename").on_press(Message::RenameConfirm).padding(6),
+                                ]
+                                .spacing(12),
+                            ]
+                            .spacing(12)
+                            .max_width(300),
+                        )
+                        .padding(20)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill);
+
+                        iced::widget::stack![
+                            column![toolbar, horizontal_rule(1), panels, transfer_bar].spacing(0),
+                            dialog,
+                        ]
+                        .into()
+                    }
+                };
+
+                container(content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
             }
         }
     }
 
     pub fn theme(&self) -> Theme {
         self.theme.to_iced_theme()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        keyboard::on_key_press(|key, modifiers| {
+            Some(Message::KeyPressed(key, modifiers))
+        })
     }
 }
 
