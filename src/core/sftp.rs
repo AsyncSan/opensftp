@@ -1,0 +1,287 @@
+use std::sync::Arc;
+
+use russh::client;
+use russh::keys::PrivateKeyWithHashAlg;
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+
+use super::connection::AuthMethod;
+use super::known_hosts;
+
+/// SSH handler that verifies server keys against ~/.ssh/known_hosts (TOFU).
+struct SshHandler {
+    host: String,
+    port: u16,
+}
+
+impl client::Handler for SshHandler {
+    type Error = russh::Error;
+
+    fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::PublicKey,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        let result = known_hosts::check_host_key(&self.host, self.port, server_public_key);
+        async move {
+            match result {
+                Ok(_status) => Ok(true),
+                Err(e) => {
+                    eprintln!("Host key verification failed: {}", e);
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+/// Holds the SSH handle and SFTP session for the lifetime of a connection.
+pub struct SftpConnection {
+    pub sftp: SftpSession,
+    _handle: client::Handle<SshHandler>,
+}
+
+impl SftpConnection {
+    pub async fn connect(
+        host: &str,
+        port: u16,
+        username: &str,
+        auth: &AuthMethod,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let config = Arc::new(client::Config::default());
+        let addr = format!("{}:{}", host, port);
+
+        let handler = SshHandler {
+            host: host.to_string(),
+            port,
+        };
+        let mut handle = client::connect(config, &addr, handler).await?;
+
+        let auth_result = match auth {
+            AuthMethod::Password(pw) => {
+                handle.authenticate_password(username, pw).await?
+            }
+            AuthMethod::KeyFile(path) => {
+                let key_data = std::fs::read_to_string(path)?;
+                let key_pair = russh::keys::PrivateKey::from_openssh(&key_data)
+                    .map_err(|e| format!("Invalid key: {}", e))?;
+                handle
+                    .authenticate_publickey(
+                        username,
+                        PrivateKeyWithHashAlg::new(Arc::new(key_pair), None),
+                    )
+                    .await?
+            }
+            AuthMethod::Agent => {
+                return Err("SSH agent auth not yet implemented".into());
+            }
+        };
+
+        if !auth_result.success() {
+            return Err("Authentication failed".into());
+        }
+
+        let channel = handle.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(channel.into_stream()).await?;
+
+        Ok(Self {
+            sftp,
+            _handle: handle,
+        })
+    }
+
+    pub async fn list_dir(
+        &self,
+        path: &str,
+    ) -> Result<Vec<RemoteEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let read_dir = self.sftp.read_dir(path).await?;
+        let mut entries = Vec::new();
+
+        for entry in read_dir {
+            let meta = entry.metadata();
+            let is_dir = meta.file_type().is_dir();
+            let size = meta.size.unwrap_or(0);
+            let mtime = meta.mtime.unwrap_or(0) as u64;
+
+            entries.push(RemoteEntry {
+                name: entry.file_name(),
+                is_dir,
+                size,
+                mtime,
+            });
+        }
+
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+        Ok(entries)
+    }
+
+    /// Download remote file to local path with progress updates.
+    /// Sends (bytes_transferred, total_size) through the channel.
+    pub async fn download(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        progress_tx: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let meta = self.sftp.metadata(remote_path).await?;
+        let total_size = meta.size.unwrap_or(0);
+
+        let mut remote_file = self.sftp.open(remote_path).await?;
+        let mut local_file = tokio::fs::File::create(local_path).await?;
+
+        let mut transferred: u64 = 0;
+        let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
+
+        loop {
+            let n = remote_file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            local_file.write_all(&buf[..n]).await?;
+            transferred += n as u64;
+
+            let _ = progress_tx.send(TransferProgress {
+                transferred,
+                total_size,
+                done: false,
+            });
+        }
+
+        local_file.flush().await?;
+        let _ = progress_tx.send(TransferProgress {
+            transferred,
+            total_size,
+            done: true,
+        });
+
+        Ok(())
+    }
+
+    /// Upload local file to remote path with progress updates.
+    pub async fn upload(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        progress_tx: mpsc::UnboundedSender<TransferProgress>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let local_meta = tokio::fs::metadata(local_path).await?;
+        let total_size = local_meta.len();
+
+        let mut local_file = tokio::fs::File::open(local_path).await?;
+        let mut remote_file = self.sftp.open_with_flags(
+            remote_path,
+            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+        ).await?;
+
+        let mut transferred: u64 = 0;
+        let mut buf = vec![0u8; 256 * 1024];
+
+        loop {
+            let n = local_file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            remote_file.write_all(&buf[..n]).await?;
+            transferred += n as u64;
+
+            let _ = progress_tx.send(TransferProgress {
+                transferred,
+                total_size,
+                done: false,
+            });
+        }
+
+        remote_file.shutdown().await?;
+        let _ = progress_tx.send(TransferProgress {
+            transferred,
+            total_size,
+            done: true,
+        });
+
+        Ok(())
+    }
+
+    pub async fn close(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.sftp.close().await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferProgress {
+    pub transferred: u64,
+    pub total_size: u64,
+    pub done: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_entry_sort_dirs_first() {
+        let mut entries = vec![
+            RemoteEntry { name: "zebra.txt".into(), is_dir: false, size: 100, mtime: 0 },
+            RemoteEntry { name: "alpha_dir".into(), is_dir: true, size: 0, mtime: 0 },
+            RemoteEntry { name: "beta.txt".into(), is_dir: false, size: 200, mtime: 0 },
+            RemoteEntry { name: "gamma_dir".into(), is_dir: true, size: 0, mtime: 0 },
+        ];
+
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+
+        assert!(entries[0].is_dir);
+        assert!(entries[1].is_dir);
+        assert_eq!(entries[0].name, "alpha_dir");
+        assert_eq!(entries[1].name, "gamma_dir");
+        assert_eq!(entries[2].name, "beta.txt");
+        assert_eq!(entries[3].name, "zebra.txt");
+    }
+
+    #[test]
+    fn remote_entry_sort_alphabetical_within_group() {
+        let mut entries = vec![
+            RemoteEntry { name: "c.txt".into(), is_dir: false, size: 0, mtime: 0 },
+            RemoteEntry { name: "a.txt".into(), is_dir: false, size: 0, mtime: 0 },
+            RemoteEntry { name: "b.txt".into(), is_dir: false, size: 0, mtime: 0 },
+        ];
+
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+
+        assert_eq!(entries[0].name, "a.txt");
+        assert_eq!(entries[1].name, "b.txt");
+        assert_eq!(entries[2].name, "c.txt");
+    }
+
+    #[test]
+    fn transfer_progress_creation() {
+        let p = TransferProgress {
+            transferred: 512,
+            total_size: 1024,
+            done: false,
+        };
+        assert_eq!(p.transferred, 512);
+        assert_eq!(p.total_size, 1024);
+        assert!(!p.done);
+    }
+
+    #[test]
+    fn transfer_progress_done() {
+        let p = TransferProgress {
+            transferred: 1024,
+            total_size: 1024,
+            done: true,
+        };
+        assert!(p.done);
+        assert_eq!(p.transferred, p.total_size);
+    }
+}

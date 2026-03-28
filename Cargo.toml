@@ -1,0 +1,25 @@
+[package]
+name = "eurosftp"
+version = "0.1.0"
+edition = "2024"
+description = "A modern, fast SFTP client"
+license = "MIT"
+repository = "https://github.com/mylilcrowdi/eurosftp"
+authors = ["async"]
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio"] }
+russh = "0.58"
+russh-sftp = "2.1"
+tokio = { version = "1", features = ["full"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
