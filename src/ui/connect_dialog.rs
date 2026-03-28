@@ -7,6 +7,7 @@ use crate::core::connection::{AuthMethod, ConnectionProfile};
 pub enum AuthType {
     Password,
     KeyFile,
+    Agent,
 }
 
 impl std::fmt::Display for AuthType {
@@ -14,6 +15,7 @@ impl std::fmt::Display for AuthType {
         match self {
             Self::Password => write!(f, "Password"),
             Self::KeyFile => write!(f, "Key File"),
+            Self::Agent => write!(f, "SSH Agent"),
         }
     }
 }
@@ -95,7 +97,7 @@ impl ConnectState {
                     self.key_path = path.to_string_lossy().to_string();
                 }
                 AuthMethod::Agent => {
-                    self.auth_type = AuthType::Password;
+                    self.auth_type = AuthType::Agent;
                 }
             }
         }
@@ -106,6 +108,7 @@ impl ConnectState {
         match self.auth_type {
             AuthType::Password => AuthMethod::Password(self.password.clone()),
             AuthType::KeyFile => AuthMethod::KeyFile(self.key_path.clone().into()),
+            AuthType::Agent => AuthMethod::Agent,
         }
     }
 }
@@ -116,7 +119,7 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
     let auth_selector = row![
         text("Auth:").size(13),
         pick_list(
-            vec![AuthType::Password, AuthType::KeyFile],
+            vec![AuthType::Password, AuthType::KeyFile, AuthType::Agent],
             Some(state.auth_type),
             ConnectMessage::AuthTypeSelected,
         ),
@@ -144,6 +147,9 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
             ]
             .spacing(8)
             .into()
+        }
+        AuthType::Agent => {
+            text("Uses SSH_AUTH_SOCK agent").size(13).into()
         }
     };
 

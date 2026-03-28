@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{button, column, container, horizontal_rule, progress_bar, row, text, text_input};
@@ -132,6 +133,9 @@ pub struct App {
     // UI state
     active_panel: ActivePanel,
     dialog: Dialog,
+    // Double-click tracking
+    last_local_click: Option<(usize, Instant)>,
+    last_remote_click: Option<(usize, Instant)>,
 }
 
 impl Default for App {
@@ -159,6 +163,8 @@ impl Default for App {
             transfer_status: String::new(),
             active_panel: ActivePanel::Local,
             dialog: Dialog::None,
+            last_local_click: None,
+            last_remote_click: None,
         }
     }
 }
@@ -244,45 +250,60 @@ impl App {
                 self.status = format!("Failed: {}", err);
             }
 
-            Message::LocalPanel(msg) => match msg {
-                PanelMessage::EntryClicked(i) => {
-                    if let Some(entry) = self.local_entries.get(i) {
-                        if entry.is_dir {
-                            let new_path = if entry.name == ".." {
-                                std::path::Path::new(&self.local_path)
-                                    .parent()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "/".to_string())
+            Message::LocalPanel(msg) => {
+                self.active_panel = ActivePanel::Local;
+                match msg {
+                    PanelMessage::EntryClicked(i) => {
+                        let is_double = self.last_local_click
+                            .map(|(idx, t)| idx == i && t.elapsed().as_millis() < 400)
+                            .unwrap_or(false);
+                        self.last_local_click = Some((i, Instant::now()));
+
+                        if let Some(entry) = self.local_entries.get(i) {
+                            if entry.is_dir && (is_double || entry.name == "..") {
+                                let new_path = if entry.name == ".." {
+                                    std::path::Path::new(&self.local_path)
+                                        .parent()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "/".to_string())
+                                } else {
+                                    format!("{}/{}", self.local_path, entry.name)
+                                };
+                                self.local_entries = read_local_dir(&new_path);
+                                self.local_path = new_path;
+                                self.local_selected = None;
+                                self.last_local_click = None;
                             } else {
-                                format!("{}/{}", self.local_path, entry.name)
-                            };
+                                self.local_selected = Some(i);
+                            }
+                        }
+                    }
+                    PanelMessage::GoUp => {
+                        if let Some(parent) = std::path::Path::new(&self.local_path).parent() {
+                            let new_path = parent.to_string_lossy().to_string();
                             self.local_entries = read_local_dir(&new_path);
                             self.local_path = new_path;
                             self.local_selected = None;
-                        } else {
-                            self.local_selected = Some(i);
                         }
                     }
-                }
-                PanelMessage::GoUp => {
-                    if let Some(parent) = std::path::Path::new(&self.local_path).parent() {
-                        let new_path = parent.to_string_lossy().to_string();
-                        self.local_entries = read_local_dir(&new_path);
-                        self.local_path = new_path;
-                        self.local_selected = None;
+                    PanelMessage::Refresh => {
+                        self.local_entries = read_local_dir(&self.local_path);
                     }
                 }
-                PanelMessage::Refresh => {
-                    self.local_entries = read_local_dir(&self.local_path);
-                }
-            },
+            }
 
             Message::RemotePanel(msg) => {
+                self.active_panel = ActivePanel::Remote;
                 let sftp = self.sftp.clone();
                 match msg {
                     PanelMessage::EntryClicked(i) => {
+                        let is_double = self.last_remote_click
+                            .map(|(idx, t)| idx == i && t.elapsed().as_millis() < 400)
+                            .unwrap_or(false);
+                        self.last_remote_click = Some((i, Instant::now()));
+
                         if let Some(entry) = self.remote_entries.get(i) {
-                            if entry.is_dir {
+                            if entry.is_dir && (is_double || entry.name == "..") {
                                 let new_path = if entry.name == ".." {
                                     parent_path(&self.remote_path)
                                 } else {
@@ -290,6 +311,7 @@ impl App {
                                 };
                                 self.remote_path = new_path.clone();
                                 self.remote_selected = None;
+                                self.last_remote_click = None;
 
                                 if let Some(conn) = sftp {
                                     return Task::perform(
