@@ -31,6 +31,7 @@ pub enum PanelMessage {
     EntryClicked(usize),
     GoUp,
     Refresh,
+    PathSegmentClicked(String),
 }
 
 #[cfg(test)]
@@ -132,14 +133,34 @@ pub fn view_panel<'a>(
     entries: &'a [FileEntry],
     selected: Option<usize>,
 ) -> Element<'a, PanelMessage> {
-    let header = row![
+    // Clickable breadcrumbs
+    let mut breadcrumbs = row![
         button("<").on_press(PanelMessage::GoUp).padding(4),
-        text(path).size(13),
-        horizontal_space(),
-        button("Refresh").on_press(PanelMessage::Refresh).padding(4),
     ]
-    .spacing(8)
+    .spacing(2)
     .align_y(Alignment::Center);
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Root
+    breadcrumbs = breadcrumbs.push(
+        button(text("/").size(13))
+            .on_press(PanelMessage::PathSegmentClicked("/".to_string()))
+            .padding(2),
+    );
+    for (i, seg) in segments.iter().enumerate() {
+        let full_path = format!("/{}", segments[..=i].join("/"));
+        breadcrumbs = breadcrumbs.push(
+            button(text(format!("{}/", seg)).size(13))
+                .on_press(PanelMessage::PathSegmentClicked(full_path))
+                .padding(2),
+        );
+    }
+    breadcrumbs = breadcrumbs.push(horizontal_space());
+    breadcrumbs = breadcrumbs.push(
+        button("F5").on_press(PanelMessage::Refresh).padding(4),
+    );
+
+    let header = breadcrumbs;
 
     let col_header = row![
         text("Name").size(12).width(Length::FillPortion(4)),

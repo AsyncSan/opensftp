@@ -53,6 +53,11 @@ pub enum Message {
     RenameCancel,
     RemoteOpDone(String),
     RemoteOpFailed(String),
+    // Save connection
+    SaveConnection,
+    SaveConnectionName(String),
+    SaveConnectionConfirm,
+    SaveConnectionCancel,
     // Keyboard
     KeyPressed(Key, Modifiers),
 }
@@ -88,6 +93,10 @@ impl std::fmt::Debug for Message {
             Self::RenameCancel => write!(f, "RenameCancel"),
             Self::RemoteOpDone(s) => write!(f, "RemoteOpDone({})", s),
             Self::RemoteOpFailed(e) => write!(f, "RemoteOpFailed({})", e),
+            Self::SaveConnection => write!(f, "SaveConnection"),
+            Self::SaveConnectionName(n) => write!(f, "SaveConnectionName({})", n),
+            Self::SaveConnectionConfirm => write!(f, "SaveConnectionConfirm"),
+            Self::SaveConnectionCancel => write!(f, "SaveConnectionCancel"),
             Self::KeyPressed(k, m) => write!(f, "KeyPressed({:?}, {:?})", k, m),
         }
     }
@@ -112,6 +121,7 @@ enum Dialog {
     Mkdir(String),
     ConfirmDelete(String),
     Rename(String, String), // (old_name, new_name)
+    SaveProfile(String),    // profile name
 }
 
 pub struct App {
@@ -289,6 +299,11 @@ impl App {
                     PanelMessage::Refresh => {
                         self.local_entries = read_local_dir(&self.local_path);
                     }
+                    PanelMessage::PathSegmentClicked(path) => {
+                        self.local_entries = read_local_dir(&path);
+                        self.local_path = path;
+                        self.local_selected = None;
+                    }
                 }
             }
 
@@ -362,6 +377,22 @@ impl App {
                             );
                         }
                     }
+                    PanelMessage::PathSegmentClicked(path) => {
+                        self.remote_path = path.clone();
+                        self.remote_selected = None;
+                        if let Some(conn) = sftp {
+                            return Task::perform(
+                                async move {
+                                    let entries = conn.list_dir(&path).await?;
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, path))
+                                },
+                                |result| match result {
+                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                    Err(e) => Message::RemoteListingFailed(e.to_string()),
+                                },
+                            );
+                        }
+                    }
                 }
             }
 
@@ -375,152 +406,56 @@ impl App {
                 self.status = format!("Error: {}", err);
             }
 
-            // Download: remote selected file -> local path
+            // Download: remote selected -> local path (files and directories)
             Message::DownloadSelected => {
                 if let (Some(idx), Some(conn)) = (self.remote_selected, self.sftp.clone()) {
                     if let Some(entry) = self.remote_entries.get(idx) {
-                        if !entry.is_dir {
-                            let remote_file = format!("{}/{}", self.remote_path, entry.name);
-                            let local_file = format!("{}/{}", self.local_path, entry.name);
-                            let file_name = entry.name.clone();
+                        if entry.name == ".." { return Task::none(); }
+                        let remote_src = format!("{}/{}", self.remote_path, entry.name);
+                        let local_dst = format!("{}/{}", self.local_path, entry.name);
+                        let file_name = entry.name.clone();
+                        let is_dir = entry.is_dir;
 
-                            self.transfer_active = true;
-                            self.transfer_progress = 0.0;
-                            self.transfer_status = format!("Downloading {}...", file_name);
+                        self.transfer_active = true;
+                        self.transfer_progress = 0.0;
+                        self.transfer_status = format!("Downloading {}...", file_name);
 
-                            let (event_tx, event_rx) = mpsc::unbounded_channel::<TransferEvent>();
-
-                            // Spawn transfer, forward progress as events
-                            tokio::spawn(async move {
-                                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-
-                                let dl = tokio::spawn({
-                                    let conn = conn.clone();
-                                    async move {
-                                        conn.download(&remote_file, &local_file, progress_tx).await
-                                    }
-                                });
-
-                                let fwd_tx = event_tx.clone();
-                                let fwd = tokio::spawn(async move {
-                                    let mut last = 0u64;
-                                    while let Some(p) = progress_rx.recv().await {
-                                        last = p.transferred;
-                                        let _ = fwd_tx.send(TransferEvent::Progress {
-                                            transferred: p.transferred,
-                                            total_size: p.total_size,
-                                        });
-                                    }
-                                    last
-                                });
-
-                                let transferred = fwd.await.unwrap_or(0);
-                                match dl.await {
-                                    Ok(Ok(())) => {
-                                        let _ = event_tx.send(TransferEvent::Complete(
-                                            format!("Downloaded {} ({} bytes)", file_name, transferred),
-                                        ));
-                                    }
-                                    Ok(Err(e)) => {
-                                        let _ = event_tx.send(TransferEvent::Failed(e.to_string()));
-                                    }
-                                    Err(e) => {
-                                        let _ = event_tx.send(TransferEvent::Failed(e.to_string()));
-                                    }
-                                }
-                            });
-
-                            // Stream events into Iced messages
-                            let event_stream = stream::unfold(event_rx, |mut rx| async {
-                                rx.recv().await.map(|ev| (ev, rx))
-                            });
-
-                            return Task::run(event_stream, |ev| match ev {
-                                TransferEvent::Progress { transferred, total_size } => {
-                                    Message::TransferProgress(TransferProgress {
-                                        transferred,
-                                        total_size,
-                                        done: false,
-                                    })
-                                }
-                                TransferEvent::Complete(msg) => Message::TransferComplete(msg),
-                                TransferEvent::Failed(msg) => Message::TransferFailed(msg),
-                            });
-                        }
+                        return spawn_transfer(move |progress_tx| async move {
+                            if is_dir {
+                                let bytes = conn.download_dir(&remote_src, &local_dst, progress_tx).await?;
+                                Ok(format!("Downloaded {} ({} bytes)", file_name, bytes))
+                            } else {
+                                conn.download(&remote_src, &local_dst, progress_tx).await?;
+                                Ok(format!("Downloaded {}", file_name))
+                            }
+                        });
                     }
                 }
             }
 
-            // Upload: local selected file -> remote path
+            // Upload: local selected -> remote path (files and directories)
             Message::UploadSelected => {
                 if let (Some(idx), Some(conn)) = (self.local_selected, self.sftp.clone()) {
                     if let Some(entry) = self.local_entries.get(idx) {
-                        if !entry.is_dir {
-                            let local_file = format!("{}/{}", self.local_path, entry.name);
-                            let remote_file = format!("{}/{}", self.remote_path, entry.name);
-                            let file_name = entry.name.clone();
+                        if entry.name == ".." { return Task::none(); }
+                        let local_src = format!("{}/{}", self.local_path, entry.name);
+                        let remote_dst = format!("{}/{}", self.remote_path, entry.name);
+                        let file_name = entry.name.clone();
+                        let is_dir = entry.is_dir;
 
-                            self.transfer_active = true;
-                            self.transfer_progress = 0.0;
-                            self.transfer_status = format!("Uploading {}...", file_name);
+                        self.transfer_active = true;
+                        self.transfer_progress = 0.0;
+                        self.transfer_status = format!("Uploading {}...", file_name);
 
-                            let (event_tx, event_rx) = mpsc::unbounded_channel::<TransferEvent>();
-
-                            tokio::spawn(async move {
-                                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-
-                                let ul = tokio::spawn({
-                                    let conn = conn.clone();
-                                    async move {
-                                        conn.upload(&local_file, &remote_file, progress_tx).await
-                                    }
-                                });
-
-                                let fwd_tx = event_tx.clone();
-                                let fwd = tokio::spawn(async move {
-                                    let mut last = 0u64;
-                                    while let Some(p) = progress_rx.recv().await {
-                                        last = p.transferred;
-                                        let _ = fwd_tx.send(TransferEvent::Progress {
-                                            transferred: p.transferred,
-                                            total_size: p.total_size,
-                                        });
-                                    }
-                                    last
-                                });
-
-                                let transferred = fwd.await.unwrap_or(0);
-                                match ul.await {
-                                    Ok(Ok(())) => {
-                                        let _ = event_tx.send(TransferEvent::Complete(
-                                            format!("Uploaded {} ({} bytes)", file_name, transferred),
-                                        ));
-                                    }
-                                    Ok(Err(e)) => {
-                                        let _ = event_tx.send(TransferEvent::Failed(e.to_string()));
-                                    }
-                                    Err(e) => {
-                                        let _ = event_tx.send(TransferEvent::Failed(e.to_string()));
-                                    }
-                                }
-                            });
-
-                            let event_stream = stream::unfold(event_rx, |mut rx| async {
-                                rx.recv().await.map(|ev| (ev, rx))
-                            });
-
-                            return Task::run(event_stream, |ev| match ev {
-                                TransferEvent::Progress { transferred, total_size } => {
-                                    Message::TransferProgress(TransferProgress {
-                                        transferred,
-                                        total_size,
-                                        done: false,
-                                    })
-                                }
-                                TransferEvent::Complete(msg) => Message::TransferComplete(msg),
-                                TransferEvent::Failed(msg) => Message::TransferFailed(msg),
-                            });
-                        }
+                        return spawn_transfer(move |progress_tx| async move {
+                            if is_dir {
+                                let bytes = conn.upload_dir(&local_src, &remote_dst, progress_tx).await?;
+                                Ok(format!("Uploaded {} ({} bytes)", file_name, bytes))
+                            } else {
+                                conn.upload(&local_src, &remote_dst, progress_tx).await?;
+                                Ok(format!("Uploaded {}", file_name))
+                            }
+                        });
                     }
                 }
             }
@@ -714,6 +649,47 @@ impl App {
                 self.status = format!("Error: {}", err);
             }
 
+            // Save connection as profile
+            Message::SaveConnection => {
+                if self.screen == Screen::Browser {
+                    let default_name = format!("{}@{}", self.connect_state.username, self.connect_state.host);
+                    self.dialog = Dialog::SaveProfile(default_name);
+                }
+            }
+            Message::SaveConnectionName(name) => {
+                if let Dialog::SaveProfile(ref mut n) = self.dialog {
+                    *n = name;
+                }
+            }
+            Message::SaveConnectionConfirm => {
+                if let Dialog::SaveProfile(ref name) = self.dialog {
+                    if !name.is_empty() {
+                        use crate::core::connection::ConnectionProfile;
+                        let profile = ConnectionProfile {
+                            name: name.clone(),
+                            host: self.connect_state.host.clone(),
+                            port: self.connect_state.port.parse().unwrap_or(22),
+                            username: self.connect_state.username.clone(),
+                            auth: self.connect_state.auth_method(),
+                        };
+                        let mut profiles = self.connect_state.profiles.clone();
+                        // Replace existing or add new
+                        if let Some(existing) = profiles.iter_mut().find(|p| p.name == *name) {
+                            *existing = profile;
+                        } else {
+                            profiles.push(profile);
+                        }
+                        let _ = ConnectionProfile::save_all(&profiles);
+                        self.connect_state.profiles = profiles;
+                        self.status = format!("Saved connection \"{}\"", name);
+                    }
+                    self.dialog = Dialog::None;
+                }
+            }
+            Message::SaveConnectionCancel => {
+                self.dialog = Dialog::None;
+            }
+
             // Keyboard shortcuts
             Message::KeyPressed(key, _modifiers) => {
                 if self.dialog != Dialog::None {
@@ -817,6 +793,7 @@ impl App {
                         if has_remote_selection { btn = btn.on_press(Message::RemoteDelete); }
                         btn
                     },
+                    button("Save").on_press(Message::SaveConnection).padding(4),
                     button(self.theme.name())
                         .on_press(Message::CycleTheme)
                         .padding(4),
@@ -827,14 +804,14 @@ impl App {
                 .spacing(8)
                 .padding(8);
 
-                // Transfer buttons between panels
+                // Transfer buttons between panels (files and directories)
                 let can_upload = self.local_selected.is_some()
                     && self.local_entries.get(self.local_selected.unwrap_or(0))
-                        .map_or(false, |e| !e.is_dir)
+                        .map_or(false, |e| e.name != "..")
                     && !self.transfer_active;
                 let can_download = self.remote_selected.is_some()
                     && self.remote_entries.get(self.remote_selected.unwrap_or(0))
-                        .map_or(false, |e| !e.is_dir)
+                        .map_or(false, |e| e.name != "..")
                     && !self.transfer_active;
 
                 let mut upload_btn = button("Upload >>").padding(6);
@@ -980,6 +957,33 @@ impl App {
                         ]
                         .into()
                     }
+                    Dialog::SaveProfile(name) => {
+                        let dialog = container(
+                            column![
+                                text("Save Connection").size(16),
+                                text_input("Profile name", name)
+                                    .on_input(Message::SaveConnectionName)
+                                    .on_submit(Message::SaveConnectionConfirm)
+                                    .padding(8),
+                                row![
+                                    button("Cancel").on_press(Message::SaveConnectionCancel).padding(6),
+                                    button("Save").on_press(Message::SaveConnectionConfirm).padding(6),
+                                ]
+                                .spacing(12),
+                            ]
+                            .spacing(12)
+                            .max_width(300),
+                        )
+                        .padding(20)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill);
+
+                        iced::widget::stack![
+                            column![toolbar, horizontal_rule(1), panels, transfer_bar].spacing(0),
+                            dialog,
+                        ]
+                        .into()
+                    }
                 };
 
                 container(content)
@@ -999,6 +1003,49 @@ impl App {
             Some(Message::KeyPressed(key, modifiers))
         })
     }
+}
+
+/// Spawn a transfer task and return a streaming Task for live progress.
+fn spawn_transfer<F, Fut>(transfer_fn: F) -> Task<Message>
+where
+    F: FnOnce(mpsc::UnboundedSender<TransferProgress>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<String, Box<dyn std::error::Error + Send + Sync>>> + Send,
+{
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<TransferEvent>();
+
+    tokio::spawn(async move {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<TransferProgress>();
+
+        let fwd_tx = event_tx.clone();
+        let fwd = tokio::spawn(async move {
+            while let Some(p) = progress_rx.recv().await {
+                let _ = fwd_tx.send(TransferEvent::Progress {
+                    transferred: p.transferred,
+                    total_size: p.total_size,
+                });
+            }
+        });
+
+        let result = transfer_fn(progress_tx).await;
+        let _ = fwd.await;
+
+        match result {
+            Ok(msg) => { let _ = event_tx.send(TransferEvent::Complete(msg)); }
+            Err(e) => { let _ = event_tx.send(TransferEvent::Failed(e.to_string())); }
+        }
+    });
+
+    let event_stream = stream::unfold(event_rx, |mut rx| async {
+        rx.recv().await.map(|ev| (ev, rx))
+    });
+
+    Task::run(event_stream, |ev| match ev {
+        TransferEvent::Progress { transferred, total_size } => {
+            Message::TransferProgress(TransferProgress { transferred, total_size, done: false })
+        }
+        TransferEvent::Complete(msg) => Message::TransferComplete(msg),
+        TransferEvent::Failed(msg) => Message::TransferFailed(msg),
+    })
 }
 
 fn remote_to_file_entries(entries: &[RemoteEntry]) -> Vec<FileEntry> {

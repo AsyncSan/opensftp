@@ -273,6 +273,66 @@ impl SftpConnection {
         Ok(())
     }
 
+    /// Recursively download a directory.
+    pub fn download_dir<'a>(
+        &'a self,
+        remote_path: &'a str,
+        local_path: &'a str,
+        progress_tx: mpsc::UnboundedSender<TransferProgress>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::fs::create_dir_all(local_path).await?;
+            let entries = self.list_dir(remote_path).await?;
+            let mut total_transferred = 0u64;
+
+            for entry in &entries {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                let remote = format!("{}/{}", remote_path, entry.name);
+                let local = format!("{}/{}", local_path, entry.name);
+
+                if entry.is_dir {
+                    total_transferred += self.download_dir(&remote, &local, progress_tx.clone()).await?;
+                } else {
+                    self.download(&remote, &local, progress_tx.clone()).await?;
+                    total_transferred += entry.size;
+                }
+            }
+            Ok(total_transferred)
+        })
+    }
+
+    /// Recursively upload a directory.
+    pub fn upload_dir<'a>(
+        &'a self,
+        local_path: &'a str,
+        remote_path: &'a str,
+        progress_tx: mpsc::UnboundedSender<TransferProgress>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.mkdir(remote_path).await;
+
+            let mut read_dir = tokio::fs::read_dir(local_path).await?;
+            let mut total_transferred = 0u64;
+
+            while let Some(entry) = read_dir.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let local = format!("{}/{}", local_path, name);
+                let remote = format!("{}/{}", remote_path, name);
+                let meta = entry.metadata().await?;
+
+                if meta.is_dir() {
+                    total_transferred += self.upload_dir(&local, &remote, progress_tx.clone()).await?;
+                } else {
+                    self.upload(&local, &remote, progress_tx.clone()).await?;
+                    total_transferred += meta.len();
+                }
+            }
+            Ok(total_transferred)
+        })
+    }
+
     pub async fn close(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sftp.close().await?;
         Ok(())
