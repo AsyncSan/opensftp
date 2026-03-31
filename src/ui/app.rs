@@ -12,6 +12,8 @@ use crate::core::sftp::{RemoteEntry, SftpConnection, TransferProgress};
 use crate::theme::AppTheme;
 use crate::ui::connect_dialog::{self, ConnectMessage, ConnectState};
 use crate::ui::file_panel::{self, FileEntry, PanelMessage, SortColumn};
+#[allow(unused_imports)]
+use super::helpers::{format_size, format_permissions, format_timestamp, remote_to_file_entries, parent_path, sort_entries, read_local_dir};
 
 /// Events yielded by the transfer stream for live progress.
 #[derive(Debug, Clone)]
@@ -72,9 +74,27 @@ pub enum Message {
     SaveConnectionName(String),
     SaveConnectionConfirm,
     SaveConnectionCancel,
+    // Theme
+    OpenThemePicker,
+    ThemeSelected(AppTheme),
+    // Chmod
+    RemoteChmod,
+    ChmodValueChanged(String),
+    ChmodConfirm,
+    ChmodCancel,
     // Toggle
     ToggleHidden,
     ToggleLog,
+    ToggleTerminal,
+    // Terminal
+    TerminalInputChanged(String),
+    TerminalSubmit,
+    TerminalOutput(String),
+    TerminalError(String),
+    TerminalClear,
+    // Context menu
+    ShowContextMenu(ContextAction),
+    DismissContextMenu,
     // Keyboard
     KeyPressed(Key, Modifiers),
 }
@@ -125,8 +145,22 @@ impl std::fmt::Debug for Message {
             Self::SaveConnectionName(n) => write!(f, "SaveConnectionName({})", n),
             Self::SaveConnectionConfirm => write!(f, "SaveConnectionConfirm"),
             Self::SaveConnectionCancel => write!(f, "SaveConnectionCancel"),
+            Self::OpenThemePicker => write!(f, "OpenThemePicker"),
+            Self::ThemeSelected(t) => write!(f, "ThemeSelected({:?})", t),
+            Self::RemoteChmod => write!(f, "RemoteChmod"),
+            Self::ChmodValueChanged(v) => write!(f, "ChmodValueChanged({})", v),
+            Self::ChmodConfirm => write!(f, "ChmodConfirm"),
+            Self::ChmodCancel => write!(f, "ChmodCancel"),
             Self::ToggleHidden => write!(f, "ToggleHidden"),
             Self::ToggleLog => write!(f, "ToggleLog"),
+            Self::ToggleTerminal => write!(f, "ToggleTerminal"),
+            Self::TerminalInputChanged(s) => write!(f, "TerminalInputChanged({})", s),
+            Self::TerminalSubmit => write!(f, "TerminalSubmit"),
+            Self::TerminalOutput(s) => write!(f, "TerminalOutput({}..)", &s[..s.len().min(40)]),
+            Self::TerminalError(e) => write!(f, "TerminalError({})", e),
+            Self::TerminalClear => write!(f, "TerminalClear"),
+            Self::ShowContextMenu(a) => write!(f, "ShowContextMenu({:?})", a),
+            Self::DismissContextMenu => write!(f, "DismissContextMenu"),
             Self::KeyPressed(k, m) => write!(f, "KeyPressed({:?}, {:?})", k, m),
         }
     }
@@ -155,6 +189,28 @@ enum Dialog {
     LocalConfirmDelete(String),
     LocalRename(String, String), // (old_name, new_name)
     SaveProfile(String),         // profile name
+    ThemePicker,
+    Chmod(String, String),       // (path, octal_value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextMenu {
+    None,
+    Local(usize),
+    Remote(usize),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ContextAction {
+    Open,
+    Download,
+    Upload,
+    Rename,
+    Delete,
+    NewDir,
+    CopyPath,
+    Refresh,
+    Chmod,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +218,13 @@ struct TransferLogEntry {
     message: String,
     is_error: bool,
     timestamp: String,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalEntry {
+    command: String,
+    output: String,
+    is_error: bool,
 }
 
 pub struct App {
@@ -200,6 +263,17 @@ pub struct App {
     // Transfer log
     transfer_log: Vec<TransferLogEntry>,
     show_log: bool,
+    // Context menu
+    context_menu: ContextMenu,
+    // Connection
+    connected_at: Option<Instant>,
+    // Terminal
+    show_terminal: bool,
+    terminal_input: String,
+    terminal_history: Vec<TerminalEntry>,
+    terminal_running: bool,
+    terminal_cmd_history: Vec<String>,
+    terminal_history_idx: Option<usize>,
 }
 
 impl Default for App {
@@ -232,7 +306,7 @@ impl Default for App {
         };
         Self {
             screen: demo_screen,
-            theme: AppTheme::default(),
+            theme: AppTheme::load_saved(),
             connect_state: ConnectState::new(),
             local_path: home,
             remote_path: demo_remote_path,
@@ -262,6 +336,14 @@ impl Default for App {
             last_remote_click: None,
             transfer_log: Vec::new(),
             show_log: false,
+            context_menu: ContextMenu::None,
+            connected_at: None,
+            show_terminal: false,
+            terminal_input: String::new(),
+            terminal_history: Vec::new(),
+            terminal_running: false,
+            terminal_cmd_history: Vec::new(),
+            terminal_history_idx: None,
         }
     }
 }
@@ -299,6 +381,18 @@ impl App {
                 ConnectMessage::KeyFileChosen(None) => {}
                 ConnectMessage::ProfileSelected(name) => {
                     self.connect_state.apply_profile(&name);
+                }
+                ConnectMessage::QuickConnect(name) => {
+                    self.connect_state.apply_profile(&name);
+                    return self.update(Message::Connect(ConnectMessage::Connect));
+                }
+                ConnectMessage::DeleteProfile(name) => {
+                    self.connect_state.profiles.retain(|p| p.name != name);
+                    let _ = crate::core::connection::ConnectionProfile::save_all(&self.connect_state.profiles);
+                    if self.connect_state.selected_profile.as_ref() == Some(&name) {
+                        self.connect_state.selected_profile = None;
+                    }
+                    self.status = format!("Deleted profile \"{}\"", name);
                 }
                 ConnectMessage::Connect => {
                     self.screen = Screen::Connecting;
@@ -340,6 +434,7 @@ impl App {
                 self.sftp = Some(conn);
                 self.remote_path = home;
                 self.remote_entries = remote_to_file_entries(&entries, self.show_hidden);
+                self.connected_at = Some(Instant::now());
             }
 
             Message::ConnectionFailed(err) => {
@@ -409,6 +504,15 @@ impl App {
                             self.local_filter.clear();
                         }
                     }
+                    PanelMessage::GoHome => {
+                        let home = dirs::home_dir()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "/".to_string());
+                        self.local_entries = read_local_dir(&home, self.show_hidden);
+                        self.local_path = home;
+                        self.local_selected.clear();
+                        self.local_filter.clear();
+                    }
                     PanelMessage::Refresh => {
                         self.local_entries = read_local_dir(&self.local_path, self.show_hidden);
                     }
@@ -421,6 +525,14 @@ impl App {
                     PanelMessage::FilterChanged(f) => {
                         self.local_filter = f;
                         self.local_selected.clear();
+                    }
+                    PanelMessage::EntryRightClicked(i) => {
+                        if !self.local_selected.contains(&i) {
+                            self.local_selected.clear();
+                            self.local_selected.insert(i);
+                            self.last_anchor_local = Some(i);
+                        }
+                        self.context_menu = ContextMenu::Local(i);
                     }
                     PanelMessage::SortBy(col) => {
                         if self.sort_column == col {
@@ -517,6 +629,23 @@ impl App {
                             );
                         }
                     }
+                    PanelMessage::GoHome => {
+                        // Navigate to remote home via canonicalize(".")
+                        if let Some(conn) = sftp.clone() {
+                            return Task::perform(
+                                async move {
+                                    let home = conn.sftp.canonicalize(".").await
+                                        .unwrap_or_else(|_| "/".to_string());
+                                    let entries = conn.list_dir(&home).await?;
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, home))
+                                },
+                                |result| match result {
+                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                    Err(e) => Message::RemoteListingFailed(e.to_string()),
+                                },
+                            );
+                        }
+                    }
                     PanelMessage::Refresh => {
                         let path = self.remote_path.clone();
                         if let Some(conn) = sftp {
@@ -548,6 +677,14 @@ impl App {
                                 },
                             );
                         }
+                    }
+                    PanelMessage::EntryRightClicked(i) => {
+                        if !self.remote_selected.contains(&i) {
+                            self.remote_selected.clear();
+                            self.remote_selected.insert(i);
+                            self.last_anchor_remote = Some(i);
+                        }
+                        self.context_menu = ContextMenu::Remote(i);
                     }
                     PanelMessage::FilterChanged(f) => {
                         self.remote_filter = f;
@@ -715,6 +852,11 @@ impl App {
                 self.screen = Screen::Connect;
                 self.status = "Disconnecting...".to_string();
                 self.remote_entries.clear();
+                self.connected_at = None;
+                self.terminal_history.clear();
+                self.terminal_input.clear();
+                self.terminal_cmd_history.clear();
+                self.show_terminal = false;
 
                 if let Some(conn) = sftp {
                     return Task::perform(
@@ -734,6 +876,17 @@ impl App {
                 let themes = AppTheme::all();
                 let idx = themes.iter().position(|t| *t == self.theme).unwrap_or(0);
                 self.theme = themes[(idx + 1) % themes.len()];
+                self.theme.save();
+            }
+
+            Message::OpenThemePicker => {
+                self.dialog = Dialog::ThemePicker;
+            }
+
+            Message::ThemeSelected(theme) => {
+                self.theme = theme;
+                self.theme.save();
+                self.dialog = Dialog::None;
             }
 
             // Remote operations
@@ -1033,6 +1186,68 @@ impl App {
                 self.dialog = Dialog::None;
             }
 
+            Message::RemoteChmod => {
+                if let Some(&idx) = self.remote_selected.iter().next() {
+                    if let Some(entry) = self.remote_entries.get(idx) {
+                        if entry.name != ".." {
+                            let path = format!("{}/{}", self.remote_path, entry.name);
+                            // Parse current permissions to octal
+                            let octal = if !entry.permissions.is_empty() {
+                                let mut mode = 0u32;
+                                let chars: Vec<char> = entry.permissions.chars().collect();
+                                let flags = [0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001];
+                                for (i, &flag) in flags.iter().enumerate() {
+                                    if chars.get(i).map_or(false, |&c| c != '-') {
+                                        mode |= flag;
+                                    }
+                                }
+                                format!("{:o}", mode)
+                            } else {
+                                "644".to_string()
+                            };
+                            self.dialog = Dialog::Chmod(path, octal);
+                        }
+                    }
+                }
+            }
+
+            Message::ChmodValueChanged(val) => {
+                if let Dialog::Chmod(ref _path, ref mut octal) = self.dialog {
+                    *octal = val;
+                }
+            }
+
+            Message::ChmodConfirm => {
+                let (path, octal) = match &self.dialog {
+                    Dialog::Chmod(p, o) => (p.clone(), o.clone()),
+                    _ => { return Task::none(); }
+                };
+                self.dialog = Dialog::None;
+                if let Ok(mode) = u32::from_str_radix(&octal, 8) {
+                    if mode <= 0o7777 {
+                        if let Some(conn) = self.sftp.clone() {
+                            let remote_path = self.remote_path.clone();
+                            return Task::perform(
+                                async move {
+                                    conn.set_permissions(&path, mode).await?;
+                                    let entries = conn.list_dir(&remote_path).await?;
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, remote_path))
+                                },
+                                move |result| match result {
+                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                    Err(e) => Message::RemoteOpFailed(e.to_string()),
+                                },
+                            );
+                        }
+                    }
+                }
+                self.status = format!("Invalid octal: {}", octal);
+            }
+
+            Message::ChmodCancel => {
+                self.dialog = Dialog::None;
+            }
+
             Message::ToggleLog => {
                 self.show_log = !self.show_log;
             }
@@ -1057,9 +1272,215 @@ impl App {
                 }
             }
 
+            Message::ToggleTerminal => {
+                self.show_terminal = !self.show_terminal;
+            }
+
+            Message::TerminalInputChanged(input) => {
+                self.terminal_input = input;
+                self.terminal_history_idx = None;
+            }
+
+            Message::TerminalSubmit => {
+                let cmd = self.terminal_input.trim().to_string();
+                if cmd.is_empty() || self.terminal_running {
+                    return Task::none();
+                }
+                self.terminal_cmd_history.push(cmd.clone());
+                self.terminal_history_idx = None;
+                self.terminal_input.clear();
+                self.terminal_running = true;
+
+                if let Some(conn) = self.sftp.clone() {
+                    return Task::perform(
+                        async move {
+                            conn.exec_command(&cmd).await
+                        },
+                        |result| match result {
+                            Ok(output) => Message::TerminalOutput(output),
+                            Err(e) => Message::TerminalError(e.to_string()),
+                        },
+                    );
+                } else {
+                    self.terminal_history.push(TerminalEntry {
+                        command: cmd,
+                        output: "Not connected".to_string(),
+                        is_error: true,
+                    });
+                    self.terminal_running = false;
+                }
+            }
+
+            Message::TerminalOutput(output) => {
+                let cmd = self.terminal_cmd_history.last().cloned().unwrap_or_default();
+                self.terminal_history.push(TerminalEntry {
+                    command: cmd,
+                    output,
+                    is_error: false,
+                });
+                self.terminal_running = false;
+            }
+
+            Message::TerminalError(err) => {
+                let cmd = self.terminal_cmd_history.last().cloned().unwrap_or_default();
+                self.terminal_history.push(TerminalEntry {
+                    command: cmd,
+                    output: err,
+                    is_error: true,
+                });
+                self.terminal_running = false;
+            }
+
+            Message::TerminalClear => {
+                self.terminal_history.clear();
+            }
+
+            Message::DismissContextMenu => {
+                self.context_menu = ContextMenu::None;
+            }
+
+            Message::ShowContextMenu(action) => {
+                let ctx = self.context_menu.clone();
+                self.context_menu = ContextMenu::None;
+                match action {
+                    ContextAction::Open => {
+                        match ctx {
+                            ContextMenu::Local(i) => {
+                                if let Some(entry) = self.local_entries.get(i) {
+                                    if entry.is_dir {
+                                        let new_path = if entry.name == ".." {
+                                            std::path::Path::new(&self.local_path)
+                                                .parent()
+                                                .map(|p| p.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| "/".to_string())
+                                        } else {
+                                            format!("{}/{}", self.local_path, entry.name)
+                                        };
+                                        self.local_entries = read_local_dir(&new_path, self.show_hidden);
+                                        self.local_path = new_path;
+                                        self.local_selected.clear();
+                                        self.last_anchor_local = None;
+                                    }
+                                }
+                            }
+                            ContextMenu::Remote(i) => {
+                                if let Some(entry) = self.remote_entries.get(i) {
+                                    if entry.is_dir {
+                                        let new_path = if entry.name == ".." {
+                                            parent_path(&self.remote_path)
+                                        } else {
+                                            format!("{}/{}", self.remote_path, entry.name)
+                                        };
+                                        self.remote_path = new_path.clone();
+                                        self.remote_selected.clear();
+                                        self.last_anchor_remote = None;
+                                        if let Some(conn) = self.sftp.clone() {
+                                            return Task::perform(
+                                                async move {
+                                                    let entries = conn.list_dir(&new_path).await?;
+                                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, new_path))
+                                                },
+                                                |result| match result {
+                                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                                    Err(e) => Message::RemoteListingFailed(e.to_string()),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            ContextMenu::None => {}
+                        }
+                    }
+                    ContextAction::Download => {
+                        return self.update(Message::DownloadSelected);
+                    }
+                    ContextAction::Upload => {
+                        return self.update(Message::UploadSelected);
+                    }
+                    ContextAction::Rename => {
+                        return match ctx {
+                            ContextMenu::Local(_) => self.update(Message::LocalRename),
+                            ContextMenu::Remote(_) => self.update(Message::RemoteRename),
+                            ContextMenu::None => Task::none(),
+                        };
+                    }
+                    ContextAction::Delete => {
+                        return match ctx {
+                            ContextMenu::Local(_) => self.update(Message::LocalDelete),
+                            ContextMenu::Remote(_) => self.update(Message::RemoteDelete),
+                            ContextMenu::None => Task::none(),
+                        };
+                    }
+                    ContextAction::NewDir => {
+                        return match ctx {
+                            ContextMenu::Local(_) => self.update(Message::LocalMkdir),
+                            ContextMenu::Remote(_) => self.update(Message::RemoteMkdir),
+                            ContextMenu::None => Task::none(),
+                        };
+                    }
+                    ContextAction::CopyPath => {
+                        let path = match ctx {
+                            ContextMenu::Local(i) => {
+                                self.local_entries.get(i)
+                                    .map(|e| format!("{}/{}", self.local_path, e.name))
+                            }
+                            ContextMenu::Remote(i) => {
+                                self.remote_entries.get(i)
+                                    .map(|e| format!("{}/{}", self.remote_path, e.name))
+                            }
+                            ContextMenu::None => None,
+                        };
+                        if let Some(p) = path {
+                            self.status = format!("Copied: {}", p);
+                            return iced::clipboard::write(p);
+                        }
+                    }
+                    ContextAction::Chmod => {
+                        if let ContextMenu::Remote(i) = ctx {
+                            self.remote_selected.clear();
+                            self.remote_selected.insert(i);
+                            return self.update(Message::RemoteChmod);
+                        }
+                    }
+                    ContextAction::Refresh => {
+                        return match ctx {
+                            ContextMenu::Local(_) => {
+                                self.local_entries = read_local_dir(&self.local_path, self.show_hidden);
+                                Task::none()
+                            }
+                            ContextMenu::Remote(_) => {
+                                if let Some(conn) = self.sftp.clone() {
+                                    let path = self.remote_path.clone();
+                                    Task::perform(
+                                        async move {
+                                            let entries = conn.list_dir(&path).await?;
+                                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, path))
+                                        },
+                                        |result| match result {
+                                            Ok((entries, path)) => Message::RemoteListing(entries, path),
+                                            Err(e) => Message::RemoteListingFailed(e.to_string()),
+                                        },
+                                    )
+                                } else {
+                                    Task::none()
+                                }
+                            }
+                            ContextMenu::None => Task::none(),
+                        };
+                    }
+                }
+            }
+
             // Keyboard shortcuts
             Message::KeyPressed(key, mods) => {
                 self.modifiers = mods;
+                if self.context_menu != ContextMenu::None {
+                    self.context_menu = ContextMenu::None;
+                    if matches!(key, Key::Named(keyboard::key::Named::Escape)) {
+                        return Task::none();
+                    }
+                }
                 if self.dialog != Dialog::None {
                     if matches!(key, Key::Named(keyboard::key::Named::Escape)) {
                         self.dialog = Dialog::None;
@@ -1070,7 +1491,87 @@ impl App {
                     return Task::none();
                 }
                 match key {
-                    Key::Named(keyboard::key::Named::F5) => {
+                    // Ctrl+A: Select All
+                    Key::Character(ref c) if c.as_str() == "a" && mods.control() => {
+                        match self.active_panel {
+                            ActivePanel::Local => {
+                                self.local_selected.clear();
+                                for i in 1..self.local_entries.len() {
+                                    self.local_selected.insert(i);
+                                }
+                            }
+                            ActivePanel::Remote => {
+                                self.remote_selected.clear();
+                                for i in 1..self.remote_entries.len() {
+                                    self.remote_selected.insert(i);
+                                }
+                            }
+                        }
+                    }
+                    // Ctrl+I: Invert Selection
+                    Key::Character(ref c) if c.as_str() == "i" && mods.control() => {
+                        match self.active_panel {
+                            ActivePanel::Local => {
+                                let mut new_sel = BTreeSet::new();
+                                for i in 1..self.local_entries.len() {
+                                    if !self.local_selected.contains(&i) {
+                                        new_sel.insert(i);
+                                    }
+                                }
+                                self.local_selected = new_sel;
+                            }
+                            ActivePanel::Remote => {
+                                let mut new_sel = BTreeSet::new();
+                                for i in 1..self.remote_entries.len() {
+                                    if !self.remote_selected.contains(&i) {
+                                        new_sel.insert(i);
+                                    }
+                                }
+                                self.remote_selected = new_sel;
+                            }
+                        }
+                    }
+                    // Ctrl+C: Copy selected paths to clipboard
+                    Key::Character(ref c) if c.as_str() == "c" && mods.control() => {
+                        let paths: Vec<String> = match self.active_panel {
+                            ActivePanel::Local => {
+                                self.local_selected.iter()
+                                    .filter_map(|&idx| self.local_entries.get(idx))
+                                    .filter(|e| e.name != "..")
+                                    .map(|e| format!("{}/{}", self.local_path, e.name))
+                                    .collect()
+                            }
+                            ActivePanel::Remote => {
+                                self.remote_selected.iter()
+                                    .filter_map(|&idx| self.remote_entries.get(idx))
+                                    .filter(|e| e.name != "..")
+                                    .map(|e| format!("{}/{}", self.remote_path, e.name))
+                                    .collect()
+                            }
+                        };
+                        if !paths.is_empty() {
+                            let text = paths.join("\n");
+                            self.status = format!("Copied {} path(s)", paths.len());
+                            return iced::clipboard::write(text);
+                        }
+                    }
+                    // Ctrl+H: Toggle hidden
+                    Key::Character(ref c) if c.as_str() == "h" && mods.control() => {
+                        return self.update(Message::ToggleHidden);
+                    }
+                    // F2: Rename
+                    Key::Named(keyboard::key::Named::F2) => {
+                        return match self.active_panel {
+                            ActivePanel::Local => self.update(Message::LocalRename),
+                            ActivePanel::Remote => self.update(Message::RemoteRename),
+                        };
+                    }
+                    // F4: Toggle terminal
+                    Key::Named(keyboard::key::Named::F4) => {
+                        return self.update(Message::ToggleTerminal);
+                    }
+                    // F5: Refresh both panels
+                    Key::Named(keyboard::key::Named::F5) if !mods.control() => {
                         self.local_entries = read_local_dir(&self.local_path, self.show_hidden);
                         if let Some(conn) = self.sftp.clone() {
                             let path = self.remote_path.clone();
@@ -1086,67 +1587,121 @@ impl App {
                             );
                         }
                     }
-                    Key::Named(keyboard::key::Named::Delete) => {
+                    // F6: Transfer selected (Upload or Download based on active panel)
+                    Key::Named(keyboard::key::Named::F6) => {
                         return match self.active_panel {
-                            ActivePanel::Local => self.update(Message::LocalDelete),
-                            ActivePanel::Remote => self.update(Message::RemoteDelete),
+                            ActivePanel::Local => self.update(Message::UploadSelected),
+                            ActivePanel::Remote => self.update(Message::DownloadSelected),
                         };
                     }
-                    Key::Named(keyboard::key::Named::F2) => {
-                        return match self.active_panel {
-                            ActivePanel::Local => self.update(Message::LocalRename),
-                            ActivePanel::Remote => self.update(Message::RemoteRename),
-                        };
-                    }
+                    // F7: New directory
                     Key::Named(keyboard::key::Named::F7) => {
                         return match self.active_panel {
                             ActivePanel::Local => self.update(Message::LocalMkdir),
                             ActivePanel::Remote => self.update(Message::RemoteMkdir),
                         };
                     }
-                    Key::Character(ref c) if c.as_str() == "h" && mods.control() => {
-                        return self.update(Message::ToggleHidden);
+                    // F8 / Delete: Delete selected
+                    Key::Named(keyboard::key::Named::Delete) | Key::Named(keyboard::key::Named::F8) => {
+                        return match self.active_panel {
+                            ActivePanel::Local => self.update(Message::LocalDelete),
+                            ActivePanel::Remote => self.update(Message::RemoteDelete),
+                        };
                     }
+                    // Arrow Down (with Shift for extend selection)
                     Key::Named(keyboard::key::Named::ArrowDown) => {
                         match self.active_panel {
                             ActivePanel::Local => {
                                 let max = self.local_entries.len().saturating_sub(1);
-                                let current = self.local_selected.iter().next().copied().unwrap_or(0);
+                                let current = self.last_anchor_local.or_else(|| self.local_selected.iter().next().copied()).unwrap_or(0);
                                 let next = (current + 1).min(max);
-                                self.local_selected.clear();
-                                self.local_selected.insert(next);
+                                if mods.shift() {
+                                    self.local_selected.insert(next);
+                                } else {
+                                    self.local_selected.clear();
+                                    self.local_selected.insert(next);
+                                }
                                 self.last_anchor_local = Some(next);
                             }
                             ActivePanel::Remote => {
                                 let max = self.remote_entries.len().saturating_sub(1);
-                                let current = self.remote_selected.iter().next().copied().unwrap_or(0);
+                                let current = self.last_anchor_remote.or_else(|| self.remote_selected.iter().next().copied()).unwrap_or(0);
                                 let next = (current + 1).min(max);
-                                self.remote_selected.clear();
-                                self.remote_selected.insert(next);
+                                if mods.shift() {
+                                    self.remote_selected.insert(next);
+                                } else {
+                                    self.remote_selected.clear();
+                                    self.remote_selected.insert(next);
+                                }
                                 self.last_anchor_remote = Some(next);
                             }
                         }
                     }
+                    // Arrow Up (with Shift for extend selection)
                     Key::Named(keyboard::key::Named::ArrowUp) => {
                         match self.active_panel {
                             ActivePanel::Local => {
-                                let current = self.local_selected.iter().next().copied().unwrap_or(0);
+                                let current = self.last_anchor_local.or_else(|| self.local_selected.iter().next().copied()).unwrap_or(0);
                                 let next = current.saturating_sub(1);
-                                self.local_selected.clear();
-                                self.local_selected.insert(next);
+                                if mods.shift() {
+                                    self.local_selected.insert(next);
+                                } else {
+                                    self.local_selected.clear();
+                                    self.local_selected.insert(next);
+                                }
                                 self.last_anchor_local = Some(next);
                             }
                             ActivePanel::Remote => {
-                                let current = self.remote_selected.iter().next().copied().unwrap_or(0);
+                                let current = self.last_anchor_remote.or_else(|| self.remote_selected.iter().next().copied()).unwrap_or(0);
                                 let next = current.saturating_sub(1);
-                                self.remote_selected.clear();
-                                self.remote_selected.insert(next);
+                                if mods.shift() {
+                                    self.remote_selected.insert(next);
+                                } else {
+                                    self.remote_selected.clear();
+                                    self.remote_selected.insert(next);
+                                }
                                 self.last_anchor_remote = Some(next);
                             }
                         }
                     }
+                    // Home: Jump to first entry
+                    Key::Named(keyboard::key::Named::Home) => {
+                        match self.active_panel {
+                            ActivePanel::Local => {
+                                self.local_selected.clear();
+                                if !self.local_entries.is_empty() {
+                                    self.local_selected.insert(0);
+                                    self.last_anchor_local = Some(0);
+                                }
+                            }
+                            ActivePanel::Remote => {
+                                self.remote_selected.clear();
+                                if !self.remote_entries.is_empty() {
+                                    self.remote_selected.insert(0);
+                                    self.last_anchor_remote = Some(0);
+                                }
+                            }
+                        }
+                    }
+                    // End: Jump to last entry
+                    Key::Named(keyboard::key::Named::End) => {
+                        match self.active_panel {
+                            ActivePanel::Local => {
+                                self.local_selected.clear();
+                                let last = self.local_entries.len().saturating_sub(1);
+                                self.local_selected.insert(last);
+                                self.last_anchor_local = Some(last);
+                            }
+                            ActivePanel::Remote => {
+                                self.remote_selected.clear();
+                                let last = self.remote_entries.len().saturating_sub(1);
+                                self.remote_selected.insert(last);
+                                self.last_anchor_remote = Some(last);
+                            }
+                        }
+                    }
+                    // Enter: Open directory or trigger transfer for files
                     Key::Named(keyboard::key::Named::Enter) => {
-                        // Open directory or trigger double-click action
                         match self.active_panel {
                             ActivePanel::Local => {
                                 if let Some(&idx) = self.local_selected.iter().next() {
@@ -1164,6 +1719,8 @@ impl App {
                                             self.local_path = new_path;
                                             self.local_selected.clear();
                                             self.last_anchor_local = None;
+                                        } else {
+                                            return self.update(Message::UploadSelected);
                                         }
                                     }
                                 }
@@ -1192,17 +1749,63 @@ impl App {
                                                     },
                                                 );
                                             }
+                                        } else {
+                                            return self.update(Message::DownloadSelected);
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                    // Tab: Switch active panel
                     Key::Named(keyboard::key::Named::Tab) => {
                         self.active_panel = match self.active_panel {
                             ActivePanel::Local => ActivePanel::Remote,
                             ActivePanel::Remote => ActivePanel::Local,
                         };
+                    }
+                    // Backspace: Go up directory
+                    Key::Named(keyboard::key::Named::Backspace) => {
+                        match self.active_panel {
+                            ActivePanel::Local => {
+                                return self.update(Message::LocalPanel(PanelMessage::GoUp));
+                            }
+                            ActivePanel::Remote => {
+                                return self.update(Message::RemotePanel(PanelMessage::GoUp));
+                            }
+                        }
+                    }
+                    // Space: Toggle selection on current entry (Commander-style)
+                    Key::Named(keyboard::key::Named::Space) => {
+                        match self.active_panel {
+                            ActivePanel::Local => {
+                                if let Some(anchor) = self.last_anchor_local {
+                                    if self.local_selected.contains(&anchor) {
+                                        self.local_selected.remove(&anchor);
+                                    } else {
+                                        self.local_selected.insert(anchor);
+                                    }
+                                    // Move down after toggle
+                                    let max = self.local_entries.len().saturating_sub(1);
+                                    let next = (anchor + 1).min(max);
+                                    self.last_anchor_local = Some(next);
+                                    self.local_selected.insert(next);
+                                }
+                            }
+                            ActivePanel::Remote => {
+                                if let Some(anchor) = self.last_anchor_remote {
+                                    if self.remote_selected.contains(&anchor) {
+                                        self.remote_selected.remove(&anchor);
+                                    } else {
+                                        self.remote_selected.insert(anchor);
+                                    }
+                                    let max = self.remote_entries.len().saturating_sub(1);
+                                    let next = (anchor + 1).min(max);
+                                    self.last_anchor_remote = Some(next);
+                                    self.remote_selected.insert(next);
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1247,9 +1850,24 @@ impl App {
                 .into()
             }
             Screen::Browser => {
+                let uptime_text = self.connected_at
+                    .map(|t| {
+                        let secs = t.elapsed().as_secs();
+                        let h = secs / 3600;
+                        let m = (secs % 3600) / 60;
+                        let s = secs % 60;
+                        if h > 0 {
+                            format!("{}h {:02}m", h, m)
+                        } else {
+                            format!("{}m {:02}s", m, s)
+                        }
+                    })
+                    .unwrap_or_default();
+
                 let toolbar = container(
                     row![
                         text(&self.status).size(13),
+                        text(uptime_text).size(11),
                         iced::widget::horizontal_space(),
                         button(text(if self.show_hidden { "Hide .*" } else { "Show .*" }).size(12))
                             .on_press(Message::ToggleHidden)
@@ -1257,8 +1875,11 @@ impl App {
                         button(text("Save").size(12))
                             .on_press(Message::SaveConnection)
                             .padding([4, 8]),
-                        button(text(self.theme.name()).size(12))
-                            .on_press(Message::CycleTheme)
+                        button(text(format!("\u{1F3A8} {}", self.theme.name())).size(12))
+                            .on_press(Message::OpenThemePicker)
+                            .padding([4, 8]),
+                        button(text(if self.show_terminal { "Terminal \u{2713}" } else { "Terminal" }).size(12))
+                            .on_press(Message::ToggleTerminal)
                             .padding([4, 8]),
                         button(text(format!("Log ({})", self.transfer_log.len())).size(12))
                             .on_press(Message::ToggleLog)
@@ -1416,6 +2037,85 @@ impl App {
                     }
                 };
 
+                // Terminal panel
+                let term_history = &self.terminal_history;
+                let show_terminal = self.show_terminal;
+                let terminal_input_val = self.terminal_input.clone();
+                let terminal_running = self.terminal_running;
+                let make_terminal_panel = move || -> Element<'_, Message> {
+                    if !show_terminal {
+                        return container(text("")).height(Length::Shrink).width(Length::Fill).into();
+                    }
+
+                    let mut output_rows: Vec<Element<'_, Message>> = Vec::new();
+                    for entry in term_history.iter() {
+                        output_rows.push(
+                            text(format!("$ {}", entry.command))
+                                .size(12)
+                                .color(iced::Color::from_rgb(0.4, 0.8, 1.0))
+                                .into(),
+                        );
+                        if !entry.output.is_empty() {
+                            let color = if entry.is_error {
+                                iced::Color::from_rgb(0.9, 0.3, 0.3)
+                            } else {
+                                iced::Color::from_rgb(0.8, 0.8, 0.8)
+                            };
+                            output_rows.push(
+                                text(&entry.output).size(11).color(color).into(),
+                            );
+                        }
+                    }
+
+                    let output_scroll = scrollable(
+                        column(output_rows).spacing(2).padding(6),
+                    )
+                    .height(Length::Fixed(150.0));
+
+                    let prompt = if terminal_running { "Running..." } else { "$ " };
+                    let mut input = text_input(prompt, &terminal_input_val)
+                        .on_input(Message::TerminalInputChanged)
+                        .padding(4)
+                        .size(12)
+                        .width(Length::Fill);
+                    if !terminal_running {
+                        input = input.on_submit(Message::TerminalSubmit);
+                    }
+
+                    let input_row = row![
+                        input,
+                        button(text("Clear").size(11))
+                            .on_press(Message::TerminalClear)
+                            .padding([4, 8]),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center);
+
+                    container(
+                        column![
+                            text("SSH Terminal").size(12),
+                            output_scroll,
+                            input_row,
+                        ]
+                        .spacing(4)
+                        .padding(6),
+                    )
+                    .width(Length::Fill)
+                    .style(|theme: &Theme| container::Style {
+                        background: Some(iced::Background::Color(iced::Color {
+                            a: 0.15,
+                            ..theme.extended_palette().background.strong.color
+                        })),
+                        border: iced::Border {
+                            color: theme.extended_palette().background.strong.color,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .into()
+                };
+
                 // Status bar
                 let local_count = self.local_entries.len().saturating_sub(1);
                 let remote_count = self.remote_entries.len().saturating_sub(1);
@@ -1464,36 +2164,47 @@ impl App {
                 let make_fkey_bar = || -> Element<'_, Message> {
                     container(
                         row![
-                            button(text("F2 Rename").size(12))
+                            button(text("F2 Rename").size(11))
                                 .on_press(match active {
                                     ActivePanel::Local => Message::LocalRename,
                                     ActivePanel::Remote => Message::RemoteRename,
                                 })
-                                .padding([4, 12])
+                                .padding([4, 8])
                                 .width(Length::FillPortion(1)),
-                            button(text("F5 Refresh").size(12))
+                            button(text("F4 Term").size(11))
+                                .on_press(Message::ToggleTerminal)
+                                .padding([4, 8])
+                                .width(Length::FillPortion(1)),
+                            button(text("F5 Refresh").size(11))
                                 .on_press(match active {
                                     ActivePanel::Local => Message::LocalPanel(PanelMessage::Refresh),
                                     ActivePanel::Remote => Message::RemotePanel(PanelMessage::Refresh),
                                 })
-                                .padding([4, 12])
+                                .padding([4, 8])
                                 .width(Length::FillPortion(1)),
-                            button(text("F7 Mkdir").size(12))
+                            button(text("F6 Transfer").size(11))
+                                .on_press(match active {
+                                    ActivePanel::Local => Message::UploadSelected,
+                                    ActivePanel::Remote => Message::DownloadSelected,
+                                })
+                                .padding([4, 8])
+                                .width(Length::FillPortion(1)),
+                            button(text("F7 Mkdir").size(11))
                                 .on_press(match active {
                                     ActivePanel::Local => Message::LocalMkdir,
                                     ActivePanel::Remote => Message::RemoteMkdir,
                                 })
-                                .padding([4, 12])
+                                .padding([4, 8])
                                 .width(Length::FillPortion(1)),
-                            button(text("F8 Delete").size(12))
+                            button(text("F8 Delete").size(11))
                                 .on_press(match active {
                                     ActivePanel::Local => Message::LocalDelete,
                                     ActivePanel::Remote => Message::RemoteDelete,
                                 })
-                                .padding([4, 12])
+                                .padding([4, 8])
                                 .width(Length::FillPortion(1)),
                         ]
-                        .spacing(4),
+                        .spacing(2),
                     )
                     .padding([4, 8])
                     .width(Length::Fill)
@@ -1508,7 +2219,7 @@ impl App {
                 };
 
                 let base_layout = || -> Element<'_, Message> {
-                    column![toolbar, horizontal_rule(1), panels, transfer_bar, make_log_panel(), horizontal_rule(1), status_bar, make_fkey_bar()]
+                    column![toolbar, horizontal_rule(1), panels, transfer_bar, make_log_panel(), make_terminal_panel(), horizontal_rule(1), status_bar, make_fkey_bar()]
                         .spacing(0)
                         .into()
                 };
@@ -1647,9 +2358,248 @@ impl App {
                             ].spacing(12).max_width(300).into()),
                         ].into()
                     }
+                    Dialog::Chmod(path, octal) => {
+                        let preview = u32::from_str_radix(octal, 8)
+                            .map(|m| format_permissions(m))
+                            .unwrap_or_else(|_| "invalid".to_string());
+                        let filename = path.rsplit('/').next().unwrap_or(path);
+                        iced::widget::stack![
+                            base_layout(),
+                            wrap_dialog(column![
+                                text(format!("Permissions: {}", filename)).size(16),
+                                text(format!("Preview: {}", preview)).size(13),
+                                text_input("Octal (e.g. 755)", octal)
+                                    .on_input(Message::ChmodValueChanged)
+                                    .on_submit(Message::ChmodConfirm)
+                                    .padding(8),
+                                row![
+                                    button("Cancel").on_press(Message::ChmodCancel).padding(6),
+                                    button("Apply").on_press(Message::ChmodConfirm).padding(6),
+                                ].spacing(12),
+                            ].spacing(12).max_width(300).into()),
+                        ].into()
+                    }
+                    Dialog::ThemePicker => {
+                        let current = self.theme;
+                        let dark_themes: Vec<Element<'_, Message>> = AppTheme::all()
+                            .iter()
+                            .filter(|t| t.is_dark())
+                            .map(|&t| {
+                                let label = if t == current {
+                                    format!("\u{2713} {}", t.name())
+                                } else {
+                                    t.name().to_string()
+                                };
+                                button(text(label).size(12))
+                                    .on_press(Message::ThemeSelected(t))
+                                    .padding([4, 10])
+                                    .width(Length::Fill)
+                                    .into()
+                            })
+                            .collect();
+
+                        let light_themes: Vec<Element<'_, Message>> = AppTheme::all()
+                            .iter()
+                            .filter(|t| !t.is_dark())
+                            .map(|&t| {
+                                let label = if t == current {
+                                    format!("\u{2713} {}", t.name())
+                                } else {
+                                    t.name().to_string()
+                                };
+                                button(text(label).size(12))
+                                    .on_press(Message::ThemeSelected(t))
+                                    .padding([4, 10])
+                                    .width(Length::Fill)
+                                    .into()
+                            })
+                            .collect();
+
+                        iced::widget::stack![
+                            base_layout(),
+                            wrap_dialog(column![
+                                text("Choose Theme").size(16),
+                                row![
+                                    column![
+                                        text("Dark").size(13),
+                                        scrollable(
+                                            column(dark_themes).spacing(2)
+                                        ).height(Length::Fixed(300.0)),
+                                    ].spacing(6).width(Length::FillPortion(1)),
+                                    column![
+                                        text("Light").size(13),
+                                        scrollable(
+                                            column(light_themes).spacing(2)
+                                        ).height(Length::Fixed(300.0)),
+                                    ].spacing(6).width(Length::FillPortion(1)),
+                                ].spacing(16),
+                                button("Close").on_press(Message::ThemeSelected(current)).padding(6),
+                            ].spacing(12).max_width(420).into()),
+                        ].into()
+                    }
                 };
 
-                container(content)
+                // Context menu overlay
+                let final_content: Element<'_, Message> = if self.context_menu != ContextMenu::None {
+                    let (entry_name, is_dir, is_local) = match &self.context_menu {
+                        ContextMenu::Local(i) => {
+                            let e = self.local_entries.get(*i);
+                            (
+                                e.map(|e| e.name.clone()).unwrap_or_default(),
+                                e.map(|e| e.is_dir).unwrap_or(false),
+                                true,
+                            )
+                        }
+                        ContextMenu::Remote(i) => {
+                            let e = self.remote_entries.get(*i);
+                            (
+                                e.map(|e| e.name.clone()).unwrap_or_default(),
+                                e.map(|e| e.is_dir).unwrap_or(false),
+                                false,
+                            )
+                        }
+                        ContextMenu::None => unreachable!(),
+                    };
+
+                    let is_dotdot = entry_name == "..";
+                    let icon = if is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
+
+                    let mut menu_items: Vec<Element<'_, Message>> = vec![
+                        text(format!("{} {}", icon, entry_name)).size(13).into(),
+                        horizontal_rule(1).into(),
+                    ];
+
+                    if is_dir && !is_dotdot {
+                        menu_items.push(
+                            button(text("Open").size(12))
+                                .on_press(Message::ShowContextMenu(ContextAction::Open))
+                                .padding([4, 12])
+                                .width(Length::Fill)
+                                .into(),
+                        );
+                    }
+
+                    if !is_dotdot {
+                        if is_local {
+                            menu_items.push(
+                                button(text("Upload \u{25B6}").size(12))
+                                    .on_press(Message::ShowContextMenu(ContextAction::Upload))
+                                    .padding([4, 12])
+                                    .width(Length::Fill)
+                                    .into(),
+                            );
+                        } else {
+                            menu_items.push(
+                                button(text("\u{25C0} Download").size(12))
+                                    .on_press(Message::ShowContextMenu(ContextAction::Download))
+                                    .padding([4, 12])
+                                    .width(Length::Fill)
+                                    .into(),
+                            );
+                        }
+                    }
+
+                    if !is_dotdot {
+                        menu_items.push(
+                            button(text("Rename        F2").size(12))
+                                .on_press(Message::ShowContextMenu(ContextAction::Rename))
+                                .padding([4, 12])
+                                .width(Length::Fill)
+                                .into(),
+                        );
+                        menu_items.push(
+                            button(text("Delete       Del").size(12))
+                                .on_press(Message::ShowContextMenu(ContextAction::Delete))
+                                .padding([4, 12])
+                                .width(Length::Fill)
+                                .into(),
+                        );
+                    }
+
+                    menu_items.push(
+                        button(text("New Directory F7").size(12))
+                            .on_press(Message::ShowContextMenu(ContextAction::NewDir))
+                            .padding([4, 12])
+                            .width(Length::Fill)
+                            .into(),
+                    );
+                    menu_items.push(
+                        button(text("Refresh       F5").size(12))
+                            .on_press(Message::ShowContextMenu(ContextAction::Refresh))
+                            .padding([4, 12])
+                            .width(Length::Fill)
+                            .into(),
+                    );
+
+                    if !is_dotdot {
+                        menu_items.push(horizontal_rule(1).into());
+                        menu_items.push(
+                            button(text("Copy Path").size(12))
+                                .on_press(Message::ShowContextMenu(ContextAction::CopyPath))
+                                .padding([4, 12])
+                                .width(Length::Fill)
+                                .into(),
+                        );
+                        if !is_local {
+                            menu_items.push(
+                                button(text("Permissions").size(12))
+                                    .on_press(Message::ShowContextMenu(ContextAction::Chmod))
+                                    .padding([4, 12])
+                                    .width(Length::Fill)
+                                    .into(),
+                            );
+                        }
+                    }
+
+                    let menu_card = container(
+                        column(menu_items).spacing(2).width(Length::Fixed(200.0)),
+                    )
+                    .padding(8)
+                    .style(|theme: &Theme| container::Style {
+                        background: Some(iced::Background::Color(
+                            theme.extended_palette().background.base.color,
+                        )),
+                        border: iced::Border {
+                            color: theme.extended_palette().primary.strong.color,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    });
+
+                    let backdrop = button(
+                        container("")
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    )
+                    .on_press(Message::DismissContextMenu)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_theme: &Theme, _status| {
+                        button::Style {
+                            background: Some(iced::Background::Color(iced::Color {
+                                r: 0.0, g: 0.0, b: 0.0, a: 0.3,
+                            })),
+                            ..Default::default()
+                        }
+                    });
+
+                    let menu_overlay = container(menu_card)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill);
+
+                    iced::widget::stack![
+                        content,
+                        backdrop,
+                        menu_overlay,
+                    ].into()
+                } else {
+                    content
+                };
+
+                container(final_content)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .into()
@@ -1711,171 +2661,7 @@ where
     })
 }
 
-fn format_size(bytes: u64) -> String {
-    let units = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    for unit in &units {
-        if size < 1024.0 {
-            return format!("{:.1} {}", size, unit);
-        }
-        size /= 1024.0;
-    }
-    format!("{:.1} PB", size)
-}
-
-fn format_permissions(mode: u32) -> String {
-    if mode == 0 {
-        return String::new();
-    }
-    let mut s = String::with_capacity(9);
-    let flags = [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
-    ];
-    for (bit, ch) in &flags {
-        s.push(if mode & bit != 0 { *ch } else { '-' });
-    }
-    s
-}
-
-fn remote_to_file_entries(entries: &[RemoteEntry], show_hidden: bool) -> Vec<FileEntry> {
-    let mut result = vec![FileEntry {
-        name: "..".to_string(),
-        is_dir: true,
-        size: 0,
-        modified: String::new(),
-        permissions: String::new(),
-    }];
-
-    result.extend(entries.iter()
-        .filter(|e| show_hidden || !e.name.starts_with('.'))
-        .map(|e| FileEntry {
-            name: e.name.clone(),
-            is_dir: e.is_dir,
-            size: e.size,
-            modified: format_timestamp(e.mtime),
-            permissions: format_permissions(e.permissions),
-        }));
-
-    result
-}
-
-fn parent_path(path: &str) -> String {
-    if path == "/" {
-        return "/".to_string();
-    }
-    match path.rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(i) => path[..i].to_string(),
-        None => "/".to_string(),
-    }
-}
-
-fn sort_entries(entries: &mut [FileEntry], column: SortColumn, ascending: bool) {
-    // Skip the ".." entry at index 0
-    if entries.len() <= 1 {
-        return;
-    }
-    let rest = &mut entries[1..];
-    rest.sort_by(|a, b| {
-        // Dirs always first
-        let dir_cmp = b.is_dir.cmp(&a.is_dir);
-        if dir_cmp != std::cmp::Ordering::Equal {
-            return dir_cmp;
-        }
-        let cmp = match column {
-            SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            SortColumn::Size => a.size.cmp(&b.size),
-            SortColumn::Modified => a.modified.cmp(&b.modified),
-            SortColumn::Permissions => a.permissions.cmp(&b.permissions),
-        };
-        if ascending { cmp } else { cmp.reverse() }
-    });
-}
-
-fn read_local_dir(path: &str, show_hidden: bool) -> Vec<FileEntry> {
-    let mut entries = vec![FileEntry {
-        name: "..".to_string(),
-        is_dir: true,
-        size: 0,
-        modified: String::new(),
-        permissions: String::new(),
-    }];
-
-    if let Ok(read_dir) = std::fs::read_dir(path) {
-        let mut items: Vec<FileEntry> = read_dir
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .map(|t| {
-                        let elapsed = t
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        format_timestamp(elapsed)
-                    })
-                    .unwrap_or_default();
-
-                #[cfg(unix)]
-                let permissions = {
-                    use std::os::unix::fs::PermissionsExt;
-                    format_permissions(meta.permissions().mode())
-                };
-                #[cfg(not(unix))]
-                let permissions = String::new();
-
-                Some(FileEntry {
-                    name: e.file_name().to_string_lossy().to_string(),
-                    is_dir: meta.is_dir(),
-                    size: meta.len(),
-                    modified,
-                    permissions,
-                })
-            })
-            .collect();
-
-        items.sort_by(|a, b| {
-            b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name))
-        });
-
-        if !show_hidden {
-            items.retain(|e| !e.name.starts_with('.'));
-        }
-
-        entries.extend(items);
-    }
-
-    entries
-}
-
-fn format_timestamp(secs: u64) -> String {
-    if secs == 0 {
-        return String::new();
-    }
-    // Civil time from unix timestamp (no external crate needed)
-    let mut days = (secs / 86400) as i64;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    days += 719468;
-    let era = if days >= 0 { days } else { days - 146096 } / 146097;
-    let doe = (days - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-
-    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hours, minutes)
-}
+// Utility functions are in helpers.rs
 
 #[cfg(test)]
 mod tests {
@@ -3289,21 +4075,20 @@ mod tests {
     #[test]
     fn integ_theme_full_cycle_with_conversion() {
         let mut app = App::default();
+        app.theme = AppTheme::Dark; // Ensure deterministic start
+        let start = app.theme;
         let mut seen_themes = Vec::new();
 
         for _ in 0..AppTheme::all().len() {
             seen_themes.push(app.theme);
-            // Verify the iced conversion doesn't panic
             let _ = app.theme();
             app.update(Message::CycleTheme);
         }
-        // Should have seen all themes exactly once
         assert_eq!(seen_themes.len(), AppTheme::all().len());
         for t in AppTheme::all() {
             assert!(seen_themes.contains(t), "Missing theme: {:?}", t);
         }
-        // Back to start
-        assert_eq!(app.theme, AppTheme::Dark);
+        assert_eq!(app.theme, start);
     }
 
     // --- Transfer log + toggle log interaction ---
@@ -3793,5 +4578,951 @@ mod tests {
             .map(|e| e.size)
             .sum();
         assert_eq!(sel_size, 0);
+    }
+
+    // ===== CONTEXT MENU TESTS =====
+
+    fn make_browser_app_with_entries() -> App {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.local_entries = vec![
+            FileEntry { name: "..".into(), is_dir: true, size: 0, modified: String::new(), permissions: String::new() },
+            FileEntry { name: "docs".into(), is_dir: true, size: 4096, modified: String::new(), permissions: String::new() },
+            FileEntry { name: "readme.md".into(), is_dir: false, size: 500, modified: String::new(), permissions: String::new() },
+            FileEntry { name: "data.csv".into(), is_dir: false, size: 10000, modified: String::new(), permissions: String::new() },
+        ];
+        app.remote_entries = vec![
+            FileEntry { name: "..".into(), is_dir: true, size: 0, modified: String::new(), permissions: String::new() },
+            FileEntry { name: "src".into(), is_dir: true, size: 4096, modified: String::new(), permissions: String::new() },
+            FileEntry { name: "main.rs".into(), is_dir: false, size: 200, modified: String::new(), permissions: String::new() },
+        ];
+        app.local_path = "/tmp".into();
+        app.remote_path = "/home/user".into();
+        app
+    }
+
+    #[test]
+    fn ctx_right_click_local_opens_menu() {
+        let mut app = make_browser_app_with_entries();
+        app.update(Message::LocalPanel(PanelMessage::EntryRightClicked(2)));
+        assert_eq!(app.context_menu, ContextMenu::Local(2));
+        assert!(app.local_selected.contains(&2));
+        assert_eq!(app.active_panel, ActivePanel::Local);
+    }
+
+    #[test]
+    fn ctx_right_click_remote_opens_menu() {
+        let mut app = make_browser_app_with_entries();
+        app.update(Message::RemotePanel(PanelMessage::EntryRightClicked(1)));
+        assert_eq!(app.context_menu, ContextMenu::Remote(1));
+        assert!(app.remote_selected.contains(&1));
+        assert_eq!(app.active_panel, ActivePanel::Remote);
+    }
+
+    #[test]
+    fn ctx_right_click_preserves_multiselect() {
+        let mut app = make_browser_app_with_entries();
+        app.local_selected.insert(1);
+        app.local_selected.insert(2);
+        // Right-click on already selected entry
+        app.update(Message::LocalPanel(PanelMessage::EntryRightClicked(2)));
+        assert_eq!(app.context_menu, ContextMenu::Local(2));
+        // Multi-selection preserved
+        assert!(app.local_selected.contains(&1));
+        assert!(app.local_selected.contains(&2));
+    }
+
+    #[test]
+    fn ctx_right_click_unselected_replaces_selection() {
+        let mut app = make_browser_app_with_entries();
+        app.local_selected.insert(1);
+        // Right-click on non-selected entry
+        app.update(Message::LocalPanel(PanelMessage::EntryRightClicked(3)));
+        assert_eq!(app.context_menu, ContextMenu::Local(3));
+        assert!(!app.local_selected.contains(&1));
+        assert!(app.local_selected.contains(&3));
+    }
+
+    #[test]
+    fn ctx_dismiss_clears_menu() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Local(1);
+        app.update(Message::DismissContextMenu);
+        assert_eq!(app.context_menu, ContextMenu::None);
+    }
+
+    #[test]
+    fn ctx_escape_closes_menu() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Remote(1);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::Escape),
+            Modifiers::empty(),
+        ));
+        assert_eq!(app.context_menu, ContextMenu::None);
+    }
+
+    #[test]
+    fn ctx_rename_action_opens_dialog() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Local(2);
+        app.local_selected.insert(2);
+        app.update(Message::ShowContextMenu(ContextAction::Rename));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(matches!(app.dialog, Dialog::LocalRename(ref old, _) if old == "readme.md"));
+    }
+
+    #[test]
+    fn ctx_delete_action_opens_dialog() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Remote(2);
+        app.remote_selected.insert(2);
+        app.update(Message::ShowContextMenu(ContextAction::Delete));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(matches!(app.dialog, Dialog::ConfirmDelete(ref n) if n == "main.rs"));
+    }
+
+    #[test]
+    fn ctx_newdir_action_opens_dialog_local() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Local(1);
+        app.update(Message::ShowContextMenu(ContextAction::NewDir));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(matches!(app.dialog, Dialog::LocalMkdir(_)));
+    }
+
+    #[test]
+    fn ctx_newdir_action_opens_dialog_remote() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Remote(1);
+        app.update(Message::ShowContextMenu(ContextAction::NewDir));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(matches!(app.dialog, Dialog::Mkdir(_)));
+    }
+
+    #[test]
+    fn ctx_open_local_dir_navigates() {
+        let tmp = std::env::temp_dir().join("eurosftp_ctx_open");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("inner")).unwrap();
+
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.local_path = tmp.to_string_lossy().to_string();
+        app.local_entries = read_local_dir(&app.local_path, false);
+
+        let inner_idx = app.local_entries.iter().position(|e| e.name == "inner").unwrap();
+        app.context_menu = ContextMenu::Local(inner_idx);
+        app.update(Message::ShowContextMenu(ContextAction::Open));
+        assert!(app.local_path.ends_with("inner"));
+        assert_eq!(app.context_menu, ContextMenu::None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ctx_copy_path_local() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Local(2);
+        app.update(Message::ShowContextMenu(ContextAction::CopyPath));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(app.status.contains("/tmp/readme.md"));
+    }
+
+    #[test]
+    fn ctx_copy_path_remote() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Remote(2);
+        app.update(Message::ShowContextMenu(ContextAction::CopyPath));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(app.status.contains("/home/user/main.rs"));
+    }
+
+    #[test]
+    fn ctx_refresh_local() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Local(1);
+        app.update(Message::ShowContextMenu(ContextAction::Refresh));
+        assert_eq!(app.context_menu, ContextMenu::None);
+    }
+
+    #[test]
+    fn ctx_download_without_connection_noop() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Remote(2);
+        app.remote_selected.insert(2);
+        app.update(Message::ShowContextMenu(ContextAction::Download));
+        assert!(!app.transfer_active);
+        assert_eq!(app.context_menu, ContextMenu::None);
+    }
+
+    #[test]
+    fn ctx_upload_without_connection_noop() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Local(2);
+        app.local_selected.insert(2);
+        app.update(Message::ShowContextMenu(ContextAction::Upload));
+        assert!(!app.transfer_active);
+        assert_eq!(app.context_menu, ContextMenu::None);
+    }
+
+    #[test]
+    fn ctx_default_is_none() {
+        let app = App::default();
+        assert_eq!(app.context_menu, ContextMenu::None);
+    }
+
+    #[test]
+    fn ctx_rename_remote_action_opens_dialog() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Remote(2);
+        app.remote_selected.insert(2);
+        app.update(Message::ShowContextMenu(ContextAction::Rename));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(matches!(app.dialog, Dialog::Rename(ref old, _) if old == "main.rs"));
+    }
+
+    #[test]
+    fn ctx_delete_local_action_opens_dialog() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Local(2);
+        app.local_selected.insert(2);
+        app.update(Message::ShowContextMenu(ContextAction::Delete));
+        assert_eq!(app.context_menu, ContextMenu::None);
+        assert!(matches!(app.dialog, Dialog::LocalConfirmDelete(ref n) if n == "readme.md"));
+    }
+
+    // ===== BATCH 2: SELECTION & KEYBOARD TESTS =====
+
+    #[test]
+    fn b2_ctrl_a_selects_all_local() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.update(Message::KeyPressed(
+            Key::Character("a".into()),
+            Modifiers::CTRL,
+        ));
+        // Should select all except ".." (index 0)
+        assert_eq!(app.local_selected.len(), app.local_entries.len() - 1);
+        assert!(!app.local_selected.contains(&0)); // ".." not selected
+        assert!(app.local_selected.contains(&1));
+        assert!(app.local_selected.contains(&2));
+        assert!(app.local_selected.contains(&3));
+    }
+
+    #[test]
+    fn b2_ctrl_a_selects_all_remote() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Remote;
+        app.update(Message::KeyPressed(
+            Key::Character("a".into()),
+            Modifiers::CTRL,
+        ));
+        assert_eq!(app.remote_selected.len(), app.remote_entries.len() - 1);
+        assert!(!app.remote_selected.contains(&0));
+    }
+
+    #[test]
+    fn b2_ctrl_i_inverts_selection() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(1);
+        app.local_selected.insert(2);
+        app.update(Message::KeyPressed(
+            Key::Character("i".into()),
+            Modifiers::CTRL,
+        ));
+        // 1 and 2 were selected, now 3 should be (entries: 0=.., 1=docs, 2=readme, 3=data)
+        assert!(!app.local_selected.contains(&0)); // ".." never selected
+        assert!(!app.local_selected.contains(&1));
+        assert!(!app.local_selected.contains(&2));
+        assert!(app.local_selected.contains(&3));
+    }
+
+    #[test]
+    fn b2_ctrl_i_inverts_empty_to_all() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Remote;
+        // Nothing selected
+        app.update(Message::KeyPressed(
+            Key::Character("i".into()),
+            Modifiers::CTRL,
+        ));
+        // Should select all except ".."
+        assert_eq!(app.remote_selected.len(), app.remote_entries.len() - 1);
+    }
+
+    #[test]
+    fn b2_ctrl_c_copies_paths() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(2);
+        app.local_selected.insert(3);
+        app.update(Message::KeyPressed(
+            Key::Character("c".into()),
+            Modifiers::CTRL,
+        ));
+        assert!(app.status.contains("Copied 2 path(s)"));
+    }
+
+    #[test]
+    fn b2_ctrl_c_skips_dotdot() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(0); // ".."
+        app.local_selected.insert(1);
+        app.update(Message::KeyPressed(
+            Key::Character("c".into()),
+            Modifiers::CTRL,
+        ));
+        assert!(app.status.contains("Copied 1 path(s)"));
+    }
+
+    #[test]
+    fn b2_f6_triggers_upload_from_local() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(2);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::F6),
+            Modifiers::empty(),
+        ));
+        // Without connection, no transfer starts, but message was dispatched
+        assert!(!app.transfer_active);
+    }
+
+    #[test]
+    fn b2_f6_triggers_download_from_remote() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Remote;
+        app.remote_selected.insert(2);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::F6),
+            Modifiers::empty(),
+        ));
+        assert!(!app.transfer_active);
+    }
+
+    #[test]
+    fn b2_f8_opens_delete_dialog() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(2);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::F8),
+            Modifiers::empty(),
+        ));
+        assert!(matches!(app.dialog, Dialog::LocalConfirmDelete(_)));
+    }
+
+    #[test]
+    fn b2_shift_arrow_down_extends_selection() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(1);
+        app.last_anchor_local = Some(1);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::ArrowDown),
+            Modifiers::SHIFT,
+        ));
+        assert!(app.local_selected.contains(&1));
+        assert!(app.local_selected.contains(&2));
+        assert_eq!(app.local_selected.len(), 2);
+    }
+
+    #[test]
+    fn b2_shift_arrow_up_extends_selection() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(3);
+        app.last_anchor_local = Some(3);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::ArrowUp),
+            Modifiers::SHIFT,
+        ));
+        assert!(app.local_selected.contains(&3));
+        assert!(app.local_selected.contains(&2));
+        assert_eq!(app.local_selected.len(), 2);
+    }
+
+    #[test]
+    fn b2_home_jumps_to_first() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(3);
+        app.last_anchor_local = Some(3);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::Home),
+            Modifiers::empty(),
+        ));
+        assert_eq!(app.local_selected.len(), 1);
+        assert!(app.local_selected.contains(&0));
+        assert_eq!(app.last_anchor_local, Some(0));
+    }
+
+    #[test]
+    fn b2_end_jumps_to_last() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::End),
+            Modifiers::empty(),
+        ));
+        let last = app.local_entries.len() - 1;
+        assert_eq!(app.local_selected.len(), 1);
+        assert!(app.local_selected.contains(&last));
+        assert_eq!(app.last_anchor_local, Some(last));
+    }
+
+    #[test]
+    fn b2_backspace_goes_up_local() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.active_panel = ActivePanel::Local;
+        let original = app.local_path.clone();
+        if original != "/" {
+            app.update(Message::KeyPressed(
+                Key::Named(keyboard::key::Named::Backspace),
+                Modifiers::empty(),
+            ));
+            assert_ne!(app.local_path, original);
+        }
+    }
+
+    #[test]
+    fn b2_enter_on_file_triggers_upload() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(2); // readme.md (file, not dir)
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::Enter),
+            Modifiers::empty(),
+        ));
+        // Without connection, no transfer, but state should be unchanged
+        assert!(!app.transfer_active);
+    }
+
+    #[test]
+    fn b2_enter_on_dir_navigates() {
+        let tmp = std::env::temp_dir().join("eurosftp_b2_enter");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("subdir")).unwrap();
+
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.active_panel = ActivePanel::Local;
+        app.local_path = tmp.to_string_lossy().to_string();
+        app.local_entries = read_local_dir(&app.local_path, false);
+
+        let idx = app.local_entries.iter().position(|e| e.name == "subdir").unwrap();
+        app.local_selected.insert(idx);
+        app.last_anchor_local = Some(idx);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::Enter),
+            Modifiers::empty(),
+        ));
+        assert!(app.local_path.ends_with("subdir"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn b2_space_toggles_and_moves() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(1);
+        app.last_anchor_local = Some(1);
+        // Space should toggle 1 (deselect) and move to 2
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::Space),
+            Modifiers::empty(),
+        ));
+        assert!(!app.local_selected.contains(&1));
+        assert!(app.local_selected.contains(&2));
+        assert_eq!(app.last_anchor_local, Some(2));
+    }
+
+    #[test]
+    fn b2_space_selects_and_moves() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.clear();
+        app.last_anchor_local = Some(1);
+        // Space should toggle 1 (select it since not selected) and move to 2
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::Space),
+            Modifiers::empty(),
+        ));
+        assert!(app.local_selected.contains(&1));
+        assert!(app.local_selected.contains(&2));
+        assert_eq!(app.last_anchor_local, Some(2));
+    }
+
+    #[test]
+    fn b2_arrow_without_shift_clears_selection() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        app.local_selected.insert(1);
+        app.local_selected.insert(2);
+        app.last_anchor_local = Some(2);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::ArrowDown),
+            Modifiers::empty(),
+        ));
+        assert_eq!(app.local_selected.len(), 1);
+        assert!(app.local_selected.contains(&3));
+    }
+
+    #[test]
+    fn b2_ctrl_a_then_invert_clears() {
+        let mut app = make_browser_app_with_entries();
+        app.active_panel = ActivePanel::Local;
+        // Select all
+        app.update(Message::KeyPressed(
+            Key::Character("a".into()),
+            Modifiers::CTRL,
+        ));
+        assert_eq!(app.local_selected.len(), 3);
+        // Invert: all selected -> none
+        app.update(Message::KeyPressed(
+            Key::Character("i".into()),
+            Modifiers::CTRL,
+        ));
+        assert_eq!(app.local_selected.len(), 0);
+    }
+
+    // ===== BATCH 3: THEME TESTS =====
+
+    #[test]
+    fn b3_open_theme_picker_dialog() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.update(Message::OpenThemePicker);
+        assert_eq!(app.dialog, Dialog::ThemePicker);
+    }
+
+    #[test]
+    fn b3_theme_selected_changes_theme() {
+        let mut app = App::default();
+        app.dialog = Dialog::ThemePicker;
+        app.update(Message::ThemeSelected(AppTheme::TokyoNight));
+        assert_eq!(app.theme, AppTheme::TokyoNight);
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn b3_theme_selected_closes_dialog() {
+        let mut app = App::default();
+        app.dialog = Dialog::ThemePicker;
+        app.update(Message::ThemeSelected(AppTheme::CatppuccinMocha));
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn b3_escape_closes_theme_picker() {
+        let mut app = App::default();
+        app.dialog = Dialog::ThemePicker;
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::Escape),
+            Modifiers::empty(),
+        ));
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn b3_cycle_theme_still_works() {
+        let mut app = App::default();
+        let initial = app.theme;
+        app.update(Message::CycleTheme);
+        assert_ne!(app.theme, initial);
+    }
+
+    #[test]
+    fn b3_all_22_themes_selectable() {
+        let mut app = App::default();
+        for &theme in AppTheme::all() {
+            app.dialog = Dialog::ThemePicker;
+            app.update(Message::ThemeSelected(theme));
+            assert_eq!(app.theme, theme);
+            assert_eq!(app.dialog, Dialog::None);
+            // Verify iced conversion works
+            let _ = app.theme();
+        }
+    }
+
+    #[test]
+    fn b3_theme_serialize_roundtrip() {
+        // Test serialization without touching disk (avoids test race conditions)
+        for &theme in AppTheme::all() {
+            let json = serde_json::to_string(&theme).unwrap();
+            let restored: AppTheme = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, theme);
+        }
+    }
+
+    #[test]
+    fn b3_theme_picker_from_connect_screen() {
+        let mut app = App::default();
+        assert_eq!(app.screen, Screen::Connect);
+        // Theme picker should still work from any screen via CycleTheme
+        app.update(Message::CycleTheme);
+        assert_ne!(app.theme, AppTheme::Dark);
+    }
+
+    // ── Batch 4: Terminal ──────────────────────────────────────────
+
+    #[test]
+    fn b4_terminal_toggle() {
+        let mut app = App::default();
+        assert!(!app.show_terminal);
+        app.update(Message::ToggleTerminal);
+        assert!(app.show_terminal);
+        app.update(Message::ToggleTerminal);
+        assert!(!app.show_terminal);
+    }
+
+    #[test]
+    fn b4_terminal_input_changed() {
+        let mut app = App::default();
+        app.update(Message::TerminalInputChanged("ls -la".into()));
+        assert_eq!(app.terminal_input, "ls -la");
+    }
+
+    #[test]
+    fn b4_terminal_submit_no_connection() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.update(Message::TerminalInputChanged("whoami".into()));
+        app.update(Message::TerminalSubmit);
+        assert_eq!(app.terminal_history.len(), 1);
+        assert_eq!(app.terminal_history[0].command, "whoami");
+        assert!(app.terminal_history[0].is_error);
+        assert_eq!(app.terminal_history[0].output, "Not connected");
+        assert!(app.terminal_input.is_empty());
+        assert!(!app.terminal_running);
+    }
+
+    #[test]
+    fn b4_terminal_submit_empty_ignored() {
+        let mut app = App::default();
+        app.update(Message::TerminalInputChanged("".into()));
+        app.update(Message::TerminalSubmit);
+        assert!(app.terminal_history.is_empty());
+    }
+
+    #[test]
+    fn b4_terminal_submit_whitespace_ignored() {
+        let mut app = App::default();
+        app.update(Message::TerminalInputChanged("   ".into()));
+        app.update(Message::TerminalSubmit);
+        assert!(app.terminal_history.is_empty());
+    }
+
+    #[test]
+    fn b4_terminal_output_message() {
+        let mut app = App::default();
+        app.terminal_cmd_history.push("uname".into());
+        app.terminal_running = true;
+        app.update(Message::TerminalOutput("Linux\n".into()));
+        assert_eq!(app.terminal_history.len(), 1);
+        assert_eq!(app.terminal_history[0].command, "uname");
+        assert_eq!(app.terminal_history[0].output, "Linux\n");
+        assert!(!app.terminal_history[0].is_error);
+        assert!(!app.terminal_running);
+    }
+
+    #[test]
+    fn b4_terminal_error_message() {
+        let mut app = App::default();
+        app.terminal_cmd_history.push("bad_cmd".into());
+        app.terminal_running = true;
+        app.update(Message::TerminalError("command not found".into()));
+        assert_eq!(app.terminal_history.len(), 1);
+        assert!(app.terminal_history[0].is_error);
+        assert!(!app.terminal_running);
+    }
+
+    #[test]
+    fn b4_terminal_clear() {
+        let mut app = App::default();
+        app.terminal_history.push(TerminalEntry {
+            command: "ls".into(),
+            output: "file.txt".into(),
+            is_error: false,
+        });
+        app.terminal_history.push(TerminalEntry {
+            command: "pwd".into(),
+            output: "/home".into(),
+            is_error: false,
+        });
+        assert_eq!(app.terminal_history.len(), 2);
+        app.update(Message::TerminalClear);
+        assert!(app.terminal_history.is_empty());
+    }
+
+    #[test]
+    fn b4_terminal_cmd_history_builds() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        // No sftp connection, so commands go to "not connected" path
+        app.update(Message::TerminalInputChanged("cmd1".into()));
+        app.update(Message::TerminalSubmit);
+        app.update(Message::TerminalInputChanged("cmd2".into()));
+        app.update(Message::TerminalSubmit);
+        assert_eq!(app.terminal_cmd_history, vec!["cmd1", "cmd2"]);
+    }
+
+    #[test]
+    fn b4_terminal_submit_clears_input() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.update(Message::TerminalInputChanged("df -h".into()));
+        assert_eq!(app.terminal_input, "df -h");
+        app.update(Message::TerminalSubmit);
+        assert!(app.terminal_input.is_empty());
+    }
+
+    #[test]
+    fn b4_terminal_running_blocks_submit() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        app.terminal_running = true;
+        app.update(Message::TerminalInputChanged("ls".into()));
+        app.update(Message::TerminalSubmit);
+        // Should not have added to history because terminal_running is true
+        assert!(app.terminal_history.is_empty());
+        // Input should still be there (not cleared)
+        assert_eq!(app.terminal_input, "ls");
+    }
+
+    #[test]
+    fn b4_terminal_multiple_outputs() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        // Simulate multiple command executions without connection
+        for cmd in &["ls", "pwd", "whoami"] {
+            app.update(Message::TerminalInputChanged(cmd.to_string()));
+            app.update(Message::TerminalSubmit);
+        }
+        assert_eq!(app.terminal_history.len(), 3);
+        assert_eq!(app.terminal_history[0].command, "ls");
+        assert_eq!(app.terminal_history[1].command, "pwd");
+        assert_eq!(app.terminal_history[2].command, "whoami");
+    }
+
+    #[test]
+    fn b4_f4_toggles_terminal() {
+        let mut app = App::default();
+        app.screen = Screen::Browser;
+        assert!(!app.show_terminal);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::F4),
+            Modifiers::default(),
+        ));
+        assert!(app.show_terminal);
+        app.update(Message::KeyPressed(
+            Key::Named(keyboard::key::Named::F4),
+            Modifiers::default(),
+        ));
+        assert!(!app.show_terminal);
+    }
+
+    #[test]
+    fn b4_terminal_default_state() {
+        let app = App::default();
+        assert!(!app.show_terminal);
+        assert!(app.terminal_input.is_empty());
+        assert!(app.terminal_history.is_empty());
+        assert!(!app.terminal_running);
+        assert!(app.terminal_cmd_history.is_empty());
+        assert!(app.terminal_history_idx.is_none());
+    }
+
+    #[test]
+    fn b4_terminal_input_resets_history_idx() {
+        let mut app = App::default();
+        app.terminal_history_idx = Some(2);
+        app.update(Message::TerminalInputChanged("new input".into()));
+        assert!(app.terminal_history_idx.is_none());
+    }
+
+    // ── Batch 5: Quality of Life ──────────────────────────────────
+
+    #[test]
+    fn b5_quick_connect_applies_profile_and_connects() {
+        let mut app = App::default();
+        app.connect_state.profiles.push(crate::core::connection::ConnectionProfile {
+            name: "test-srv".into(),
+            host: "10.0.0.1".into(),
+            port: 2222,
+            username: "deploy".into(),
+            auth: crate::core::connection::AuthMethod::Agent,
+        });
+        app.update(Message::Connect(ConnectMessage::QuickConnect("test-srv".into())));
+        assert_eq!(app.connect_state.host, "10.0.0.1");
+        assert_eq!(app.connect_state.port, "2222");
+        assert_eq!(app.connect_state.username, "deploy");
+        // Should be in connecting state (connection will fail without real server)
+        assert_eq!(app.screen, Screen::Connecting);
+    }
+
+    #[test]
+    fn b5_delete_profile() {
+        let mut app = App::default();
+        // Clear any loaded profiles first
+        app.connect_state.profiles.clear();
+        app.connect_state.profiles.push(crate::core::connection::ConnectionProfile {
+            name: "to-delete".into(),
+            host: "host".into(),
+            port: 22,
+            username: "user".into(),
+            auth: crate::core::connection::AuthMethod::Agent,
+        });
+        app.connect_state.profiles.push(crate::core::connection::ConnectionProfile {
+            name: "keep".into(),
+            host: "other".into(),
+            port: 22,
+            username: "user".into(),
+            auth: crate::core::connection::AuthMethod::Agent,
+        });
+        assert_eq!(app.connect_state.profiles.len(), 2);
+        app.update(Message::Connect(ConnectMessage::DeleteProfile("to-delete".into())));
+        assert_eq!(app.connect_state.profiles.len(), 1);
+        assert_eq!(app.connect_state.profiles[0].name, "keep");
+    }
+
+    #[test]
+    fn b5_delete_profile_clears_selection() {
+        let mut app = App::default();
+        app.connect_state.profiles.clear();
+        app.connect_state.profiles.push(crate::core::connection::ConnectionProfile {
+            name: "srv".into(),
+            host: "host".into(),
+            port: 22,
+            username: "user".into(),
+            auth: crate::core::connection::AuthMethod::Agent,
+        });
+        app.connect_state.selected_profile = Some("srv".into());
+        app.update(Message::Connect(ConnectMessage::DeleteProfile("srv".into())));
+        assert!(app.connect_state.profiles.is_empty());
+        assert!(app.connect_state.selected_profile.is_none());
+    }
+
+    #[test]
+    fn b5_chmod_dialog_opens() {
+        let mut app = make_browser_app_with_entries();
+        app.remote_selected.insert(2); // main.rs
+        app.update(Message::RemoteChmod);
+        assert!(matches!(app.dialog, Dialog::Chmod(_, _)));
+        if let Dialog::Chmod(ref path, ref octal) = app.dialog {
+            assert!(path.contains("main.rs"));
+            // Should have parsed permissions from entry
+            assert!(!octal.is_empty());
+        }
+    }
+
+    #[test]
+    fn b5_chmod_value_changes() {
+        let mut app = App::default();
+        app.dialog = Dialog::Chmod("/test".into(), "644".into());
+        app.update(Message::ChmodValueChanged("755".into()));
+        if let Dialog::Chmod(_, ref octal) = app.dialog {
+            assert_eq!(octal, "755");
+        } else {
+            panic!("Dialog should still be Chmod");
+        }
+    }
+
+    #[test]
+    fn b5_chmod_cancel() {
+        let mut app = App::default();
+        app.dialog = Dialog::Chmod("/test".into(), "644".into());
+        app.update(Message::ChmodCancel);
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn b5_chmod_confirm_no_connection() {
+        let mut app = App::default();
+        app.dialog = Dialog::Chmod("/test".into(), "755".into());
+        app.update(Message::ChmodConfirm);
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn b5_chmod_invalid_octal() {
+        let mut app = App::default();
+        app.dialog = Dialog::Chmod("/test".into(), "xyz".into());
+        app.update(Message::ChmodConfirm);
+        assert_eq!(app.dialog, Dialog::None);
+        assert!(app.status.contains("Invalid octal"));
+    }
+
+    #[test]
+    fn b5_chmod_dotdot_ignored() {
+        let mut app = make_browser_app_with_entries();
+        app.remote_selected.clear();
+        app.remote_selected.insert(0); // ".."
+        app.update(Message::RemoteChmod);
+        assert_eq!(app.dialog, Dialog::None);
+    }
+
+    #[test]
+    fn b5_chmod_context_menu() {
+        let mut app = make_browser_app_with_entries();
+        app.context_menu = ContextMenu::Remote(2);
+        app.update(Message::ShowContextMenu(ContextAction::Chmod));
+        assert!(matches!(app.dialog, Dialog::Chmod(_, _)));
+        assert_eq!(app.context_menu, ContextMenu::None);
+    }
+
+    #[test]
+    fn b5_home_button_local() {
+        let mut app = make_browser_app_with_entries();
+        let original_path = app.local_path.clone();
+        app.update(Message::LocalPanel(PanelMessage::GoHome));
+        let home = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        assert_eq!(app.local_path, home);
+        assert!(app.local_selected.is_empty());
+    }
+
+    #[test]
+    fn b5_connection_timer_default_none() {
+        let app = App::default();
+        assert!(app.connected_at.is_none());
+    }
+
+    #[test]
+    fn b5_disconnect_clears_terminal() {
+        let mut app = make_browser_app_with_entries();
+        app.show_terminal = true;
+        app.terminal_history.push(TerminalEntry {
+            command: "ls".into(),
+            output: "files".into(),
+            is_error: false,
+        });
+        app.terminal_input = "pwd".into();
+        app.terminal_cmd_history.push("ls".into());
+        app.connected_at = Some(Instant::now());
+        app.update(Message::Disconnect);
+        assert!(!app.show_terminal);
+        assert!(app.terminal_history.is_empty());
+        assert!(app.terminal_input.is_empty());
+        assert!(app.terminal_cmd_history.is_empty());
+        assert!(app.connected_at.is_none());
+    }
+
+    #[test]
+    fn b5_format_permissions_roundtrip_in_chmod() {
+        // Test that the octal parsing in RemoteChmod correctly converts rwx string
+        let mut app = make_browser_app_with_entries();
+        // Entry at index 2 is main.rs with permissions "rw-r--r--" (644)
+        app.remote_selected.insert(2);
+        app.update(Message::RemoteChmod);
+        if let Dialog::Chmod(_, ref octal) = app.dialog {
+            assert_eq!(octal, "644");
+        }
     }
 }

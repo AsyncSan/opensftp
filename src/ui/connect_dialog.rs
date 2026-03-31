@@ -33,6 +33,8 @@ pub enum ConnectMessage {
     Connect,
     Cancel,
     ProfileSelected(String),
+    QuickConnect(String),
+    DeleteProfile(String),
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +118,63 @@ impl ConnectState {
 pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> {
     let profile_names: Vec<String> = state.profiles.iter().map(|p| p.name.clone()).collect();
 
+    // Quick Connect cards
+    let quick_cards: Vec<Element<'_, ConnectMessage>> = state.profiles.iter().map(|p| {
+        let auth_label = match &p.auth {
+            AuthMethod::Password(_) => "\u{1F511}",
+            AuthMethod::KeyFile(_) => "\u{1F5DD}",
+            AuthMethod::Agent => "\u{1F464}",
+        };
+        let name = p.name.clone();
+        let delete_name = p.name.clone();
+        container(
+            row![
+                button(
+                    column![
+                        text(&p.name).size(13),
+                        text(format!("{} {}@{}:{}", auth_label, p.username, p.host, p.port)).size(11),
+                    ]
+                    .spacing(2),
+                )
+                .on_press(ConnectMessage::QuickConnect(name))
+                .padding([8, 12])
+                .width(Length::Fill),
+                button(text("\u{2715}").size(11))
+                    .on_press(ConnectMessage::DeleteProfile(delete_name))
+                    .padding([8, 6]),
+            ]
+            .spacing(2)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                a: 0.2,
+                ..theme.extended_palette().background.strong.color
+            })),
+            border: iced::Border {
+                color: theme.extended_palette().primary.weak.color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+    }).collect();
+
+    let quick_connect_section: Element<'_, ConnectMessage> = if quick_cards.is_empty() {
+        container(text("")).height(Length::Shrink).into()
+    } else {
+        column![
+            text("Quick Connect").size(13),
+            iced::widget::scrollable(
+                column(quick_cards).spacing(4),
+            ).height(Length::Shrink),
+        ]
+        .spacing(6)
+        .into()
+    };
+
     let auth_selector = row![
         text("Auth:").size(13),
         pick_list(
@@ -156,6 +215,7 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
     let form = column![
         text("Open SFTP").size(22),
         text("Connect to Server").size(14),
+        quick_connect_section,
         pick_list(
             profile_names,
             state.selected_profile.clone(),

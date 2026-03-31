@@ -1,4 +1,4 @@
-use iced::widget::{column, container, row, scrollable, text, text_input, button, horizontal_space};
+use iced::widget::{column, container, mouse_area, row, scrollable, text, text_input, button, horizontal_space};
 use iced::{Element, Length, Alignment, Theme};
 
 #[derive(Debug, Clone)]
@@ -42,8 +42,10 @@ pub enum PanelMessage {
     GoUp,
     Refresh,
     PathSegmentClicked(String),
+    EntryRightClicked(usize),
     FilterChanged(String),
     SortBy(SortColumn),
+    GoHome,
 }
 
 #[cfg(test)]
@@ -160,6 +162,7 @@ pub fn view_panel<'a>(
     // Clickable breadcrumbs
     let mut breadcrumbs = row![
         button(text("\u{25C0}").size(12)).on_press(PanelMessage::GoUp).padding([2, 6]),
+        button(text("\u{2302}").size(12)).on_press(PanelMessage::GoHome).padding([2, 6]),
     ]
     .spacing(1)
     .align_y(Alignment::Center);
@@ -255,7 +258,7 @@ pub fn view_panel<'a>(
             let is_selected = selected.contains(&i);
             let is_even = visual_idx % 2 == 0;
             let c = container(r).width(Length::Fill);
-            if is_selected {
+            let styled: Element<'a, PanelMessage> = if is_selected {
                 c.style(|theme: &Theme| {
                     container::Style {
                         background: Some(iced::Background::Color(
@@ -279,7 +282,10 @@ pub fn view_panel<'a>(
                 .into()
             } else {
                 c.into()
-            }
+            };
+            mouse_area(styled)
+                .on_right_press(PanelMessage::EntryRightClicked(i))
+                .into()
         })
         .collect();
 

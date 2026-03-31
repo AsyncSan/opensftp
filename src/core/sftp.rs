@@ -39,7 +39,7 @@ impl client::Handler for SshHandler {
 /// Holds the SSH handle and SFTP session for the lifetime of a connection.
 pub struct SftpConnection {
     pub sftp: SftpSession,
-    _handle: client::Handle<SshHandler>,
+    handle: client::Handle<SshHandler>,
 }
 
 impl SftpConnection {
@@ -110,7 +110,7 @@ impl SftpConnection {
                     let channel = handle.channel_open_session().await?;
                     channel.request_subsystem(true, "sftp").await?;
                     let sftp = SftpSession::new(channel.into_stream()).await?;
-                    Ok(Self { sftp, _handle: handle })
+                    Ok(Self { sftp, handle })
                 };
             }
         };
@@ -125,7 +125,7 @@ impl SftpConnection {
 
         Ok(Self {
             sftp,
-            _handle: handle,
+            handle,
         })
     }
 
@@ -299,6 +299,20 @@ impl SftpConnection {
         Ok(())
     }
 
+    pub async fn set_permissions(
+        &self,
+        path: &str,
+        mode: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use russh_sftp::protocol::FileAttributes;
+        let attrs = FileAttributes {
+            permissions: Some(mode),
+            ..Default::default()
+        };
+        self.sftp.set_metadata(path, attrs).await?;
+        Ok(())
+    }
+
     /// Recursively download a directory.
     pub fn download_dir<'a>(
         &'a self,
@@ -357,6 +371,33 @@ impl SftpConnection {
             }
             Ok(total_transferred)
         })
+    }
+
+    /// Execute a command over SSH and return combined stdout+stderr output.
+    pub async fn exec_command(
+        &self,
+        command: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let channel = self.handle.channel_open_session().await?;
+        channel.exec(true, command).await?;
+
+        let mut output = Vec::new();
+        let mut channel_stream = channel.into_stream();
+        let mut buf = [0u8; 8192];
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                channel_stream.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => output.extend_from_slice(&buf[..n]),
+                Ok(Err(_)) => break,
+            }
+        }
+
+        Ok(String::from_utf8_lossy(&output).to_string())
     }
 
     pub async fn close(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
