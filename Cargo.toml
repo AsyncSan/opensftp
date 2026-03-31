@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "A modern, fast SFTP client"
 license = "MIT"
-repository = "https://github.com/mylilcrowdi/eurosftp"
+repository = "https://github.com/mylilcrowdi/Open-SFTP-Rust"
 authors = ["async"]
+
+[features]
+demo = []
 
 [dependencies]
 iced = { version = "0.13", features = ["tokio"] }

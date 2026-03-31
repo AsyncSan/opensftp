@@ -142,11 +142,14 @@ impl SftpConnection {
             let size = meta.size.unwrap_or(0);
             let mtime = meta.mtime.unwrap_or(0) as u64;
 
+            let permissions = meta.permissions.map(|p| p as u32).unwrap_or(0);
+
             entries.push(RemoteEntry {
                 name: entry.file_name(),
                 is_dir,
                 size,
                 mtime,
+                permissions,
             });
         }
 
@@ -264,6 +267,29 @@ impl SftpConnection {
         Ok(())
     }
 
+    /// Recursively remove a directory and all its contents.
+    pub fn remove_dir_all<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
+        Box::pin(async move {
+            let entries = self.list_dir(path).await?;
+            for entry in &entries {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                let child = format!("{}/{}", path, entry.name);
+                if entry.is_dir {
+                    self.remove_dir_all(&child).await?;
+                } else {
+                    self.remove_file(&child).await?;
+                }
+            }
+            self.remove_dir(path).await?;
+            Ok(())
+        })
+    }
+
     pub async fn rename(
         &self,
         from: &str,
@@ -345,6 +371,7 @@ pub struct RemoteEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: u64,
+    pub permissions: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -361,10 +388,10 @@ mod tests {
     #[test]
     fn remote_entry_sort_dirs_first() {
         let mut entries = vec![
-            RemoteEntry { name: "zebra.txt".into(), is_dir: false, size: 100, mtime: 0 },
-            RemoteEntry { name: "alpha_dir".into(), is_dir: true, size: 0, mtime: 0 },
-            RemoteEntry { name: "beta.txt".into(), is_dir: false, size: 200, mtime: 0 },
-            RemoteEntry { name: "gamma_dir".into(), is_dir: true, size: 0, mtime: 0 },
+            RemoteEntry { name: "zebra.txt".into(), is_dir: false, size: 100, mtime: 0, permissions: 0o644 },
+            RemoteEntry { name: "alpha_dir".into(), is_dir: true, size: 0, mtime: 0, permissions: 0o755 },
+            RemoteEntry { name: "beta.txt".into(), is_dir: false, size: 200, mtime: 0, permissions: 0o644 },
+            RemoteEntry { name: "gamma_dir".into(), is_dir: true, size: 0, mtime: 0, permissions: 0o755 },
         ];
 
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
@@ -380,9 +407,9 @@ mod tests {
     #[test]
     fn remote_entry_sort_alphabetical_within_group() {
         let mut entries = vec![
-            RemoteEntry { name: "c.txt".into(), is_dir: false, size: 0, mtime: 0 },
-            RemoteEntry { name: "a.txt".into(), is_dir: false, size: 0, mtime: 0 },
-            RemoteEntry { name: "b.txt".into(), is_dir: false, size: 0, mtime: 0 },
+            RemoteEntry { name: "c.txt".into(), is_dir: false, size: 0, mtime: 0, permissions: 0o644 },
+            RemoteEntry { name: "a.txt".into(), is_dir: false, size: 0, mtime: 0, permissions: 0o644 },
+            RemoteEntry { name: "b.txt".into(), is_dir: false, size: 0, mtime: 0, permissions: 0o644 },
         ];
 
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));

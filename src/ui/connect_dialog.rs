@@ -1,5 +1,5 @@
 use iced::widget::{button, column, container, pick_list, row, text, text_input};
-use iced::{Element, Length};
+use iced::{Element, Length, Theme};
 
 use crate::core::connection::{AuthMethod, ConnectionProfile};
 
@@ -154,7 +154,8 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
     };
 
     let form = column![
-        text("Connect to Server").size(20),
+        text("Open SFTP").size(22),
+        text("Connect to Server").size(14),
         pick_list(
             profile_names,
             state.selected_profile.clone(),
@@ -164,24 +165,43 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
         text_input("Host", &state.host)
             .on_input(ConnectMessage::HostChanged)
             .padding(8),
-        text_input("Port", &state.port)
-            .on_input(ConnectMessage::PortChanged)
-            .padding(8),
-        text_input("Username", &state.username)
-            .on_input(ConnectMessage::UsernameChanged)
-            .padding(8),
+        row![
+            text_input("Port", &state.port)
+                .on_input(ConnectMessage::PortChanged)
+                .padding(8)
+                .width(Length::Fixed(100.0)),
+            text_input("Username", &state.username)
+                .on_input(ConnectMessage::UsernameChanged)
+                .padding(8)
+                .width(Length::Fill),
+        ].spacing(8),
         auth_selector,
         auth_fields,
         row![
-            button("Cancel").on_press(ConnectMessage::Cancel).padding(8),
-            button("Connect").on_press(ConnectMessage::Connect).padding(8),
+            button(text("Cancel").size(13)).on_press(ConnectMessage::Cancel).padding([8, 16]),
+            button(text("Connect").size(13)).on_press(ConnectMessage::Connect).padding([8, 16]),
         ]
         .spacing(12),
     ]
-    .spacing(12)
-    .max_width(400);
+    .spacing(14)
+    .max_width(420);
 
-    container(form)
+    let card = container(form)
+        .padding(28)
+        .style(|theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                a: 0.4,
+                ..theme.extended_palette().background.strong.color
+            })),
+            border: iced::Border {
+                color: theme.extended_palette().primary.weak.color,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        });
+
+    container(card)
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)

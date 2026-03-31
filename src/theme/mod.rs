@@ -5,6 +5,9 @@ pub enum AppTheme {
     Dark,
     Light,
     Nord,
+    Dracula,
+    SolarizedDark,
+    GruvboxDark,
 }
 
 impl Default for AppTheme {
@@ -19,11 +22,14 @@ impl AppTheme {
             Self::Dark => Theme::Dark,
             Self::Light => Theme::Light,
             Self::Nord => Theme::Nord,
+            Self::Dracula => Theme::Dracula,
+            Self::SolarizedDark => Theme::SolarizedDark,
+            Self::GruvboxDark => Theme::GruvboxDark,
         }
     }
 
     pub fn all() -> &'static [AppTheme] {
-        &[Self::Dark, Self::Light, Self::Nord]
+        &[Self::Dark, Self::Light, Self::Nord, Self::Dracula, Self::SolarizedDark, Self::GruvboxDark]
     }
 
     pub fn name(self) -> &'static str {
@@ -31,6 +37,9 @@ impl AppTheme {
             Self::Dark => "Dark",
             Self::Light => "Light",
             Self::Nord => "Nord",
+            Self::Dracula => "Dracula",
+            Self::SolarizedDark => "Solarized",
+            Self::GruvboxDark => "Gruvbox",
         }
     }
 }
@@ -45,12 +54,15 @@ mod tests {
     }
 
     #[test]
-    fn all_returns_three_themes() {
+    fn all_returns_six_themes() {
         let themes = AppTheme::all();
-        assert_eq!(themes.len(), 3);
+        assert_eq!(themes.len(), 6);
         assert!(themes.contains(&AppTheme::Dark));
         assert!(themes.contains(&AppTheme::Light));
         assert!(themes.contains(&AppTheme::Nord));
+        assert!(themes.contains(&AppTheme::Dracula));
+        assert!(themes.contains(&AppTheme::SolarizedDark));
+        assert!(themes.contains(&AppTheme::GruvboxDark));
     }
 
     #[test]
@@ -58,14 +70,16 @@ mod tests {
         assert_eq!(AppTheme::Dark.name(), "Dark");
         assert_eq!(AppTheme::Light.name(), "Light");
         assert_eq!(AppTheme::Nord.name(), "Nord");
+        assert_eq!(AppTheme::Dracula.name(), "Dracula");
+        assert_eq!(AppTheme::SolarizedDark.name(), "Solarized");
+        assert_eq!(AppTheme::GruvboxDark.name(), "Gruvbox");
     }
 
     #[test]
     fn to_iced_theme_mapping() {
-        // Just verify it doesn't panic
-        let _ = AppTheme::Dark.to_iced_theme();
-        let _ = AppTheme::Light.to_iced_theme();
-        let _ = AppTheme::Nord.to_iced_theme();
+        for theme in AppTheme::all() {
+            let _ = theme.to_iced_theme();
+        }
     }
 
     #[test]

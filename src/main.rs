@@ -5,7 +5,7 @@ mod ui;
 use iced::{application, Font};
 
 fn main() -> iced::Result {
-    application("EuroSFTP", ui::app::App::update, ui::app::App::view)
+    application("Open SFTP", ui::app::App::update, ui::app::App::view)
         .theme(ui::app::App::theme)
         .subscription(ui::app::App::subscription)
         .window_size(iced::Size::new(1200.0, 750.0))
