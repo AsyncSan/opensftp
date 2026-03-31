@@ -378,6 +378,7 @@ pub struct RemoteEntry {
 pub struct TransferProgress {
     pub transferred: u64,
     pub total_size: u64,
+    #[allow(dead_code)]
     pub done: bool,
 }
 

@@ -22,6 +22,7 @@ enum TransferEvent {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub enum Message {
     Connect(ConnectMessage),
     LocalPanel(PanelMessage),
@@ -1042,7 +1043,7 @@ impl App {
                 // Re-fetch remote listing with new filter
                 if let Some(conn) = self.sftp.clone() {
                     let path = self.remote_path.clone();
-                    let show_hidden = self.show_hidden;
+                    let _show_hidden = self.show_hidden;
                     return Task::perform(
                         async move {
                             let entries = conn.list_dir(&path).await?;

@@ -7,6 +7,7 @@ use russh::keys::PublicKey;
 
 /// Result of checking a host key against known_hosts.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum HostKeyStatus {
     /// Key matches what we have on file.
     Known,

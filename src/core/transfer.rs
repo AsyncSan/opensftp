@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TransferItem {
     pub local_path: PathBuf,
     pub remote_path: String,
@@ -11,12 +12,14 @@ pub struct TransferItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum TransferDirection {
     Upload,
     Download,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum TransferStatus {
     Queued,
     InProgress,
@@ -25,6 +28,7 @@ pub enum TransferStatus {
 }
 
 impl TransferItem {
+    #[allow(dead_code)]
     pub fn progress(&self) -> f32 {
         if self.size == 0 {
             return 1.0;

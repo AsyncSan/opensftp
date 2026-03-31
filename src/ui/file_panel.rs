@@ -36,6 +36,7 @@ pub enum SortColumn {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum PanelMessage {
     EntryClicked(usize, bool, bool), // (index, ctrl_held, shift_held)
     GoUp,
