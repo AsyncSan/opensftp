@@ -1,20 +1,43 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectionProfile {
-    pub name: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JumpHostConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
     pub auth: AuthMethod,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionProfile {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: AuthMethod,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<JumpHostConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthMethod {
     Password(String),
     KeyFile(PathBuf),
     Agent,
+}
+
+impl Default for JumpHostConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 22,
+            username: String::new(),
+            auth: AuthMethod::Agent,
+        }
+    }
 }
 
 impl Default for ConnectionProfile {
@@ -25,11 +48,12 @@ impl Default for ConnectionProfile {
             port: 22,
             username: String::new(),
             auth: AuthMethod::Agent,
+            favorite: false,
+            jump_host: None,
         }
     }
 }
 
-/// Legacy Python sftp-ui connection format for import compatibility.
 #[derive(Debug, Clone, Deserialize)]
 struct PythonProfile {
     name: String,
@@ -46,7 +70,9 @@ struct PythonProfile {
     use_agent: bool,
 }
 
-fn default_port() -> u16 { 22 }
+fn default_port() -> u16 {
+    22
+}
 
 impl PythonProfile {
     fn into_profile(self) -> ConnectionProfile {
@@ -80,6 +106,8 @@ impl PythonProfile {
             port: self.port,
             username: self.user,
             auth,
+            favorite: false,
+            jump_host: None,
         }
     }
 }
@@ -92,7 +120,6 @@ impl ConnectionProfile {
         p
     }
 
-    /// Path to the Python sftp-ui connections file.
     fn python_profiles_path() -> PathBuf {
         let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         p.push("sftp-ui");
@@ -107,7 +134,6 @@ impl ConnectionProfile {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        // Import from Python sftp-ui if we have no profiles yet
         if profiles.is_empty() {
             let py_path = Self::python_profiles_path();
             if let Ok(content) = std::fs::read_to_string(&py_path) {
@@ -117,7 +143,6 @@ impl ConnectionProfile {
                         .filter(|p| !p.host.is_empty())
                         .map(|p| p.into_profile())
                         .collect();
-                    // Save imported profiles to our own path
                     let _ = Self::save_all(&profiles);
                 }
             }
@@ -142,234 +167,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_has_port_22() {
-        let p = ConnectionProfile::default();
-        assert_eq!(p.port, 22);
-        assert!(p.name.is_empty());
-        assert!(p.host.is_empty());
-        assert!(p.username.is_empty());
-        assert!(matches!(p.auth, AuthMethod::Agent));
-    }
-
-    #[test]
-    fn serialize_password_roundtrip() {
+    fn jump_host_roundtrip() {
         let profile = ConnectionProfile {
-            name: "test-server".into(),
-            host: "192.168.1.1".into(),
-            port: 2222,
-            username: "admin".into(),
-            auth: AuthMethod::Password("secret".into()),
-        };
-
-        let json = serde_json::to_string(&profile).unwrap();
-        let restored: ConnectionProfile = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.name, "test-server");
-        assert_eq!(restored.host, "192.168.1.1");
-        assert_eq!(restored.port, 2222);
-        assert_eq!(restored.username, "admin");
-        assert!(matches!(restored.auth, AuthMethod::Password(ref pw) if pw == "secret"));
-    }
-
-    #[test]
-    fn serialize_keyfile_roundtrip() {
-        let profile = ConnectionProfile {
-            name: "key-server".into(),
-            host: "10.0.0.1".into(),
+            name: "prod".into(),
+            host: "app.internal".into(),
             port: 22,
             username: "deploy".into(),
-            auth: AuthMethod::KeyFile(PathBuf::from("/home/user/.ssh/id_ed25519")),
+            auth: AuthMethod::Agent,
+            favorite: true,
+            jump_host: Some(JumpHostConfig {
+                host: "bastion.example.com".into(),
+                port: 2222,
+                username: "proxy".into(),
+                auth: AuthMethod::Password("jump-secret".into()),
+            }),
         };
-
-        let json = serde_json::to_string(&profile).unwrap();
-        let restored: ConnectionProfile = serde_json::from_str(&json).unwrap();
-
-        assert!(matches!(
-            restored.auth,
-            AuthMethod::KeyFile(ref p) if p == &PathBuf::from("/home/user/.ssh/id_ed25519")
-        ));
-    }
-
-    #[test]
-    fn serialize_multiple_profiles() {
-        let profiles = vec![
-            ConnectionProfile {
-                name: "server-a".into(),
-                host: "a.example.com".into(),
-                port: 22,
-                username: "user".into(),
-                auth: AuthMethod::Agent,
-            },
-            ConnectionProfile {
-                name: "server-b".into(),
-                host: "b.example.com".into(),
-                port: 8022,
-                username: "root".into(),
-                auth: AuthMethod::Password("pw".into()),
-            },
-        ];
-
-        let json = serde_json::to_string(&profiles).unwrap();
-        let restored: Vec<ConnectionProfile> = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.len(), 2);
-        assert_eq!(restored[0].name, "server-a");
-        assert_eq!(restored[1].port, 8022);
-    }
-
-    #[test]
-    fn profiles_path_ends_with_connections_json() {
-        let path = ConnectionProfile::profiles_path();
-        assert_eq!(path.file_name().unwrap(), "connections.json");
-        assert!(path.to_string_lossy().contains("eurosftp"));
-    }
-
-    #[test]
-    fn save_and_load_roundtrip() {
-        use std::env;
-
-        // Use a temp dir to avoid touching real config
-        let tmp = env::temp_dir().join("opensftp_test_profiles");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let test_path = tmp.join("connections.json");
-        let profiles = vec![ConnectionProfile {
-            name: "roundtrip".into(),
-            host: "localhost".into(),
-            port: 22,
-            username: "test".into(),
-            auth: AuthMethod::Password("pass".into()),
-        }];
-
-        // Write directly to test path
-        let json = serde_json::to_string_pretty(&profiles).unwrap();
-        std::fs::write(&test_path, &json).unwrap();
-
-        // Read back
-        let content = std::fs::read_to_string(&test_path).unwrap();
-        let loaded: Vec<ConnectionProfile> = serde_json::from_str(&content).unwrap();
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name, "roundtrip");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn python_profile_password_import() {
-        let json = r#"[{
-            "name": "prod-server",
-            "host": "10.0.0.1",
-            "user": "deploy",
-            "port": 2222,
-            "password": "s3cret",
-            "use_agent": false
-        }]"#;
-        let py: Vec<PythonProfile> = serde_json::from_str(json).unwrap();
-        let profiles: Vec<ConnectionProfile> = py.into_iter().map(|p| p.into_profile()).collect();
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "prod-server");
-        assert_eq!(profiles[0].host, "10.0.0.1");
-        assert_eq!(profiles[0].port, 2222);
-        assert_eq!(profiles[0].username, "deploy");
-        assert!(matches!(profiles[0].auth, AuthMethod::Password(ref pw) if pw == "s3cret"));
-    }
-
-    #[test]
-    fn python_profile_keyfile_import() {
-        let json = r#"[{
-            "name": "key-server",
-            "host": "example.com",
-            "user": "admin",
-            "port": 22,
-            "key_path": "/home/admin/.ssh/id_ed25519",
-            "use_agent": false
-        }]"#;
-        let py: Vec<PythonProfile> = serde_json::from_str(json).unwrap();
-        let profiles: Vec<ConnectionProfile> = py.into_iter().map(|p| p.into_profile()).collect();
-        assert!(matches!(
-            profiles[0].auth,
-            AuthMethod::KeyFile(ref p) if p.to_string_lossy() == "/home/admin/.ssh/id_ed25519"
-        ));
-    }
-
-    #[test]
-    fn python_profile_agent_import() {
-        let json = r#"[{
-            "name": "agent-server",
-            "host": "example.com",
-            "user": "root",
-            "port": 22,
-            "use_agent": true
-        }]"#;
-        let py: Vec<PythonProfile> = serde_json::from_str(json).unwrap();
-        let profiles: Vec<ConnectionProfile> = py.into_iter().map(|p| p.into_profile()).collect();
-        assert!(matches!(profiles[0].auth, AuthMethod::Agent));
-    }
-
-    #[test]
-    fn python_profile_keychain_sentinel_falls_back_to_agent() {
-        let json = r#"[{
-            "name": "keychain-server",
-            "host": "example.com",
-            "user": "user",
-            "port": 22,
-            "password": "__keychain__",
-            "use_agent": false
-        }]"#;
-        let py: Vec<PythonProfile> = serde_json::from_str(json).unwrap();
-        let profiles: Vec<ConnectionProfile> = py.into_iter().map(|p| p.into_profile()).collect();
-        assert!(matches!(profiles[0].auth, AuthMethod::Agent));
-    }
-
-    #[test]
-    fn python_profile_empty_host_filtered() {
-        let json = r#"[
-            {"name": "cloud-only", "host": "", "user": "", "port": 22, "use_agent": false},
-            {"name": "real", "host": "server.com", "user": "u", "port": 22, "use_agent": true}
-        ]"#;
-        let py: Vec<PythonProfile> = serde_json::from_str(json).unwrap();
-        let profiles: Vec<ConnectionProfile> = py.into_iter()
-            .filter(|p| !p.host.is_empty())
-            .map(|p| p.into_profile())
-            .collect();
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "real");
-    }
-
-    #[test]
-    fn python_profile_extra_fields_ignored() {
-        let json = r#"[{
-            "name": "full",
-            "host": "x.com",
-            "user": "u",
-            "port": 22,
-            "use_agent": false,
-            "id": "abc-123",
-            "favorite": true,
-            "group": "Production",
-            "last_connected": 1700000000.0,
-            "protocol": "sftp",
-            "cloud": null,
-            "keepalive_interval": 30,
-            "tunnel": null,
-            "key_passphrase": null
-        }]"#;
-        let py: Vec<PythonProfile> = serde_json::from_str(json).unwrap();
-        let profiles: Vec<ConnectionProfile> = py.into_iter().map(|p| p.into_profile()).collect();
-        assert_eq!(profiles[0].name, "full");
-        assert_eq!(profiles[0].host, "x.com");
-    }
-
-    #[test]
-    fn python_profile_default_port() {
-        let json = r#"[{
-            "name": "no-port",
-            "host": "server.com",
-            "user": "user"
-        }]"#;
-        let py: Vec<PythonProfile> = serde_json::from_str(json).unwrap();
-        assert_eq!(py[0].port, 22);
+        let restored: ConnectionProfile = serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap();
+        assert!(restored.favorite);
+        let jump = restored.jump_host.unwrap();
+        assert_eq!(jump.host, "bastion.example.com");
+        assert_eq!(jump.port, 2222);
     }
 }

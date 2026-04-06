@@ -9,6 +9,7 @@ use iced::futures::stream;
 use tokio::sync::mpsc;
 
 use crate::core::sftp::{RemoteEntry, SftpConnection, TransferProgress};
+use crate::core::connection::JumpHostConfig;
 use crate::theme::AppTheme;
 use crate::ui::connect_dialog::{self, ConnectMessage, ConnectState};
 use crate::ui::file_panel::{self, FileEntry, PanelMessage, SortColumn};
@@ -84,6 +85,7 @@ pub enum Message {
     ChmodCancel,
     // Toggle
     ToggleHidden,
+    ToggleBookmarks,
     ToggleLog,
     ToggleTerminal,
     // Terminal
@@ -152,6 +154,7 @@ impl std::fmt::Debug for Message {
             Self::ChmodConfirm => write!(f, "ChmodConfirm"),
             Self::ChmodCancel => write!(f, "ChmodCancel"),
             Self::ToggleHidden => write!(f, "ToggleHidden"),
+            Self::ToggleBookmarks => write!(f, "ToggleBookmarks"),
             Self::ToggleLog => write!(f, "ToggleLog"),
             Self::ToggleTerminal => write!(f, "ToggleTerminal"),
             Self::TerminalInputChanged(s) => write!(f, "TerminalInputChanged({})", s),
@@ -253,6 +256,7 @@ pub struct App {
     active_panel: ActivePanel,
     dialog: Dialog,
     show_hidden: bool,
+    show_bookmarks_bar: bool,
     local_filter: String,
     remote_filter: String,
     sort_column: SortColumn,
@@ -328,6 +332,7 @@ impl Default for App {
             active_panel: ActivePanel::Local,
             dialog: Dialog::None,
             show_hidden: false,
+            show_bookmarks_bar: true,
             local_filter: String::new(),
             remote_filter: String::new(),
             sort_column: SortColumn::Name,
@@ -358,6 +363,13 @@ impl App {
                 ConnectMessage::PasswordChanged(v) => self.connect_state.password = v,
                 ConnectMessage::AuthTypeSelected(t) => self.connect_state.auth_type = t,
                 ConnectMessage::KeyPathChanged(v) => self.connect_state.key_path = v,
+                ConnectMessage::JumpHostToggled(enabled) => self.connect_state.use_jump_host = enabled,
+                ConnectMessage::JumpHostChanged(v) => self.connect_state.jump_host = v,
+                ConnectMessage::JumpPortChanged(v) => self.connect_state.jump_port = v,
+                ConnectMessage::JumpUsernameChanged(v) => self.connect_state.jump_username = v,
+                ConnectMessage::JumpPasswordChanged(v) => self.connect_state.jump_password = v,
+                ConnectMessage::JumpAuthTypeSelected(t) => self.connect_state.jump_auth_type = t,
+                ConnectMessage::JumpKeyPathChanged(v) => self.connect_state.jump_key_path = v,
                 ConnectMessage::BrowseKeyFile => {
                     return Task::perform(
                         async {
@@ -394,6 +406,19 @@ impl App {
                     }
                     self.status = format!("Deleted profile \"{}\"", name);
                 }
+                ConnectMessage::ToggleFavorite(name) => {
+                    if let Some(profile) = self.connect_state.profiles.iter_mut().find(|p| p.name == name) {
+                        profile.favorite = !profile.favorite;
+                    }
+                    let _ = crate::core::connection::ConnectionProfile::save_all(&self.connect_state.profiles);
+                    if let Some(profile) = self.connect_state.profiles.iter().find(|p| p.name == name) {
+                        self.status = if profile.favorite {
+                            format!("Favorited \"{}\"", name)
+                        } else {
+                            format!("Unfavorited \"{}\"", name)
+                        };
+                    }
+                }
                 ConnectMessage::Connect => {
                     self.screen = Screen::Connecting;
                     self.status = format!(
@@ -406,9 +431,14 @@ impl App {
                     let username = self.connect_state.username.clone();
                     let auth = self.connect_state.auth_method();
 
+                    let jump_host: Option<JumpHostConfig> = self.connect_state.jump_host_config();
                     return Task::perform(
                         async move {
-                            let conn = SftpConnection::connect(&host, port, &username, &auth).await?;
+                            let conn = if let Some(jump) = jump_host {
+                                SftpConnection::connect_with_jump_host(&host, port, &username, &auth, &jump).await?
+                            } else {
+                                SftpConnection::connect(&host, port, &username, &auth).await?
+                            };
                             let conn = Arc::new(conn);
 
                             let home = conn.sftp.canonicalize(".").await
@@ -1167,6 +1197,8 @@ impl App {
                             port: self.connect_state.port.parse().unwrap_or(22),
                             username: self.connect_state.username.clone(),
                             auth: self.connect_state.auth_method(),
+                            favorite: false,
+                            jump_host: self.connect_state.jump_host_config(),
                         };
                         let mut profiles = self.connect_state.profiles.clone();
                         // Replace existing or add new
@@ -1248,6 +1280,9 @@ impl App {
                 self.dialog = Dialog::None;
             }
 
+            Message::ToggleBookmarks => {
+                self.show_bookmarks_bar = !self.show_bookmarks_bar;
+            }
             Message::ToggleLog => {
                 self.show_log = !self.show_log;
             }
@@ -1255,6 +1290,7 @@ impl App {
             Message::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
                 self.local_entries = read_local_dir(&self.local_path, self.show_hidden);
+                if !self.show_hidden { self.local_filter.clear(); }
                 // Re-fetch remote listing with new filter
                 if let Some(conn) = self.sftp.clone() {
                     let path = self.remote_path.clone();
@@ -1559,6 +1595,10 @@ impl App {
                     Key::Character(ref c) if c.as_str() == "h" && mods.control() => {
                         return self.update(Message::ToggleHidden);
                     }
+                    // Ctrl+B: Toggle bookmarks bar
+                    Key::Character(ref c) if c.as_str() == "b" && mods.control() => {
+                        return self.update(Message::ToggleBookmarks);
+                    }
                     // F2: Rename
                     Key::Named(keyboard::key::Named::F2) => {
                         return match self.active_panel {
@@ -1815,11 +1855,100 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        match self.screen {
+        let is_browser = self.screen == Screen::Browser;
+
+        // Toolbar: full when connected, minimal otherwise
+        let toolbar = if is_browser {
+            let uptime_text = self.connected_at
+                .map(|t| {
+                    let secs = t.elapsed().as_secs();
+                    let h = secs / 3600;
+                    let m = (secs % 3600) / 60;
+                    let s = secs % 60;
+                    if h > 0 { format!("{}h {:02}m", h, m) } else { format!("{}m {:02}s", m, s) }
+                })
+                .unwrap_or_default();
+            container(
+                row![
+                    text(&self.status).size(13),
+                    text(uptime_text).size(11),
+                    iced::widget::horizontal_space(),
+                    button(text(if self.show_hidden { "Hide .*" } else { "Show .*" }).size(12))
+                        .on_press(Message::ToggleHidden).padding([4, 8]),
+                    button(text("Save").size(12))
+                        .on_press(Message::SaveConnection).padding([4, 8]),
+                    button(text(format!("\u{1F3A8} {}", self.theme.name())).size(12))
+                        .on_press(Message::OpenThemePicker).padding([4, 8]),
+                    button(text(if self.show_terminal { "Terminal \u{2713}" } else { "Terminal" }).size(12))
+                        .on_press(Message::ToggleTerminal).padding([4, 8]),
+                    button(text(format!("Log ({})", self.transfer_log.len())).size(12))
+                        .on_press(Message::ToggleLog).padding([4, 8]),
+                    button(text("Disconnect").size(12))
+                        .on_press(Message::Disconnect).padding([4, 8]),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
+            )
+        } else {
+            container(
+                row![
+                    text(&self.status).size(13),
+                    iced::widget::horizontal_space(),
+                    button(text(format!("\u{1F3A8} {}", self.theme.name())).size(12))
+                        .on_press(Message::OpenThemePicker).padding([4, 8]),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
+            )
+        }
+        .padding(6)
+        .width(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                a: 0.3,
+                ..theme.extended_palette().background.strong.color
+            })),
+            ..Default::default()
+        });
+
+        // Bookmarks bar: always visible
+        let bookmarks_bar: Element<'_, Message> = if self.show_bookmarks_bar {
+            let mut bookmarks: Vec<_> = self.connect_state.profiles.iter().filter(|p| p.favorite).collect();
+            bookmarks.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            if bookmarks.is_empty() {
+                container(text("No bookmarks yet. Star a saved connection.").size(12)).width(Length::Fill).padding([4, 12]).into()
+            } else {
+                let chips: Vec<Element<'_, Message>> = bookmarks.into_iter().map(|p| {
+                    let name = p.name.clone();
+                    button(text(format!("★ {}", p.name)).size(12))
+                        .on_press(Message::Connect(ConnectMessage::QuickConnect(name)))
+                        .padding([4, 10])
+                        .into()
+                }).collect();
+                container(row(chips).spacing(6).align_y(iced::Alignment::Center)).width(Length::Fill).padding([4, 8]).into()
+            }
+        } else {
+            container(text("")).height(Length::Shrink).into()
+        };
+
+        // Local panel: always visible on the left
+        let local_panel = file_panel::view_panel(
+            "Local",
+            &self.local_path,
+            &self.local_entries,
+            &self.local_selected,
+            &self.local_filter,
+            self.active_panel == ActivePanel::Local,
+            self.sort_column,
+            self.sort_ascending,
+        )
+        .map(Message::LocalPanel);
+
+        // Right panel: connect dialog, spinner, or remote browser
+        let right_panel: Element<'_, Message> = match self.screen {
             Screen::Connect => {
                 let form = connect_dialog::view_connect_dialog(&self.connect_state)
                     .map(Message::Connect);
-
                 if self.status.starts_with("Failed") {
                     container(
                         column![
@@ -1838,10 +1967,7 @@ impl App {
             }
             Screen::Connecting => {
                 container(
-                    column![
-                        text(&self.status).size(16),
-                    ]
-                    .spacing(12),
+                    column![text(&self.status).size(16)].spacing(12),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1850,58 +1976,7 @@ impl App {
                 .into()
             }
             Screen::Browser => {
-                let uptime_text = self.connected_at
-                    .map(|t| {
-                        let secs = t.elapsed().as_secs();
-                        let h = secs / 3600;
-                        let m = (secs % 3600) / 60;
-                        let s = secs % 60;
-                        if h > 0 {
-                            format!("{}h {:02}m", h, m)
-                        } else {
-                            format!("{}m {:02}s", m, s)
-                        }
-                    })
-                    .unwrap_or_default();
-
-                let toolbar = container(
-                    row![
-                        text(&self.status).size(13),
-                        text(uptime_text).size(11),
-                        iced::widget::horizontal_space(),
-                        button(text(if self.show_hidden { "Hide .*" } else { "Show .*" }).size(12))
-                            .on_press(Message::ToggleHidden)
-                            .padding([4, 8]),
-                        button(text("Save").size(12))
-                            .on_press(Message::SaveConnection)
-                            .padding([4, 8]),
-                        button(text(format!("\u{1F3A8} {}", self.theme.name())).size(12))
-                            .on_press(Message::OpenThemePicker)
-                            .padding([4, 8]),
-                        button(text(if self.show_terminal { "Terminal \u{2713}" } else { "Terminal" }).size(12))
-                            .on_press(Message::ToggleTerminal)
-                            .padding([4, 8]),
-                        button(text(format!("Log ({})", self.transfer_log.len())).size(12))
-                            .on_press(Message::ToggleLog)
-                            .padding([4, 8]),
-                        button(text("Disconnect").size(12))
-                            .on_press(Message::Disconnect)
-                            .padding([4, 8]),
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center),
-                )
-                .padding(6)
-                .width(Length::Fill)
-                .style(|theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color {
-                        a: 0.3,
-                        ..theme.extended_palette().background.strong.color
-                    })),
-                    ..Default::default()
-                });
-
-                // Transfer buttons between panels (files and directories)
+                // Transfer buttons between panels
                 let can_upload = !self.local_selected.is_empty()
                     && self.local_selected.iter()
                         .any(|&idx| self.local_entries.get(idx).map_or(false, |e| e.name != ".."))
@@ -1911,44 +1986,22 @@ impl App {
                         .any(|&idx| self.remote_entries.get(idx).map_or(false, |e| e.name != ".."))
                     && !self.transfer_active;
 
-                let mut upload_btn = button(
-                    text("Upload \u{25B6}").size(12)
-                ).padding([6, 14]);
-                if can_upload {
-                    upload_btn = upload_btn.on_press(Message::UploadSelected);
-                }
+                let mut upload_btn = button(text("Upload \u{25B6}").size(12)).padding([6, 14]);
+                if can_upload { upload_btn = upload_btn.on_press(Message::UploadSelected); }
 
-                let mut download_btn = button(
-                    text("\u{25C0} Download").size(12)
-                ).padding([6, 14]);
-                if can_download {
-                    download_btn = download_btn.on_press(Message::DownloadSelected);
-                }
+                let mut download_btn = button(text("\u{25C0} Download").size(12)).padding([6, 14]);
+                if can_download { download_btn = download_btn.on_press(Message::DownloadSelected); }
 
                 let transfer_controls = container(
-                    column![
-                        upload_btn,
-                        download_btn,
-                    ]
-                    .spacing(12)
-                    .align_x(iced::Alignment::Center),
+                    column![upload_btn, download_btn]
+                        .spacing(12)
+                        .align_x(iced::Alignment::Center),
                 )
                 .center_y(Length::Fill)
                 .width(Length::Shrink)
                 .padding([8, 12]);
 
-                let panels = row![
-                    file_panel::view_panel(
-                        "Local",
-                        &self.local_path,
-                        &self.local_entries,
-                        &self.local_selected,
-                        &self.local_filter,
-                        self.active_panel == ActivePanel::Local,
-                        self.sort_column,
-                        self.sort_ascending,
-                    )
-                    .map(Message::LocalPanel),
+                row![
                     transfer_controls,
                     file_panel::view_panel(
                         "Remote",
@@ -1962,9 +2015,15 @@ impl App {
                     )
                     .map(Message::RemotePanel),
                 ]
-                .spacing(4);
+                .spacing(4)
+                .into()
+            }
+        };
 
-                // Transfer progress bar
+        // Dual-pane row: local always on left, right side changes
+        let panels = row![local_panel, right_panel].spacing(4);
+
+        // Transfer progress bar
                 let transfer_bar: Element<'_, Message> = if self.transfer_active {
                     let speed_text = self.transfer_start
                         .map(|start| {
@@ -2219,7 +2278,7 @@ impl App {
                 };
 
                 let base_layout = || -> Element<'_, Message> {
-                    column![toolbar, horizontal_rule(1), panels, transfer_bar, make_log_panel(), make_terminal_panel(), horizontal_rule(1), status_bar, make_fkey_bar()]
+                    column![toolbar, bookmarks_bar, horizontal_rule(1), panels, transfer_bar, make_log_panel(), make_terminal_panel(), horizontal_rule(1), status_bar, make_fkey_bar()]
                         .spacing(0)
                         .into()
                 };
@@ -2250,7 +2309,9 @@ impl App {
                         .into()
                 }
 
-                let content: Element<'_, Message> = match &self.dialog {
+                let content: Element<'_, Message> = if !is_browser {
+                    base_layout()
+                } else { match &self.dialog {
                     Dialog::None => base_layout(),
                     Dialog::Mkdir(name) => {
                         iced::widget::stack![
@@ -2437,10 +2498,10 @@ impl App {
                             ].spacing(12).max_width(420).into()),
                         ].into()
                     }
-                };
+                }};
 
                 // Context menu overlay
-                let final_content: Element<'_, Message> = if self.context_menu != ContextMenu::None {
+                let final_content: Element<'_, Message> = if is_browser && self.context_menu != ContextMenu::None {
                     let (entry_name, is_dir, is_local) = match &self.context_menu {
                         ContextMenu::Local(i) => {
                             let e = self.local_entries.get(*i);
@@ -2599,12 +2660,10 @@ impl App {
                     content
                 };
 
-                container(final_content)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
-            }
-        }
+        container(final_content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     pub fn theme(&self) -> Theme {
@@ -4045,6 +4104,8 @@ mod tests {
             port: 2222,
             username: "deploy".into(),
             auth: crate::core::connection::AuthMethod::Password("s3cret".into()),
+            favorite: false,
+            jump_host: None,
         };
         let path = tmp.join("connections.json");
         let json = serde_json::to_string_pretty(&vec![profile]).unwrap();
@@ -4274,16 +4335,28 @@ mod tests {
             port: 22,
             username: "user".into(),
             auth: AuthMethod::Agent,
+            favorite: false,
+            jump_host: None,
         }];
 
         // Open save dialog and update host
         app.connect_state.host = "new.com".into();
+        app.update(Message::Connect(ConnectMessage::JumpHostToggled(true)));
+        app.update(Message::Connect(ConnectMessage::JumpHostChanged("bastion.example.com".into())));
+        app.update(Message::Connect(ConnectMessage::JumpPortChanged("2222".into())));
+        app.update(Message::Connect(ConnectMessage::JumpUsernameChanged("jumper".into())));
+        app.update(Message::Connect(ConnectMessage::JumpPasswordChanged("pw".into())));
+        app.update(Message::Connect(ConnectMessage::JumpAuthTypeSelected(crate::ui::connect_dialog::AuthType::Password)));
         app.dialog = Dialog::SaveProfile("myserver".into());
         app.update(Message::SaveConnectionConfirm);
 
         // Should have updated, not duplicated
         assert_eq!(app.connect_state.profiles.len(), 1);
         assert_eq!(app.connect_state.profiles[0].host, "new.com");
+        let jump = app.connect_state.profiles[0].jump_host.as_ref().expect("jump host should persist");
+        assert_eq!(jump.host, "bastion.example.com");
+        assert_eq!(jump.port, 2222);
+        assert_eq!(jump.username, "jumper");
     }
 
     // --- Shift-select on remote panel ---
@@ -4505,7 +4578,7 @@ mod tests {
     // --- Transfer speed tracking state ---
     #[test]
     fn b4_transfer_start_state() {
-        let mut app = App::default();
+        let app = App::default();
         assert!(app.transfer_start.is_none());
         assert_eq!(app.transfer_bytes, 0);
         assert_eq!(app.transfer_total, 0);
@@ -5357,6 +5430,8 @@ mod tests {
             port: 2222,
             username: "deploy".into(),
             auth: crate::core::connection::AuthMethod::Agent,
+            favorite: false,
+            jump_host: None,
         });
         app.update(Message::Connect(ConnectMessage::QuickConnect("test-srv".into())));
         assert_eq!(app.connect_state.host, "10.0.0.1");
@@ -5377,6 +5452,8 @@ mod tests {
             port: 22,
             username: "user".into(),
             auth: crate::core::connection::AuthMethod::Agent,
+            favorite: false,
+            jump_host: None,
         });
         app.connect_state.profiles.push(crate::core::connection::ConnectionProfile {
             name: "keep".into(),
@@ -5384,6 +5461,8 @@ mod tests {
             port: 22,
             username: "user".into(),
             auth: crate::core::connection::AuthMethod::Agent,
+            favorite: false,
+            jump_host: None,
         });
         assert_eq!(app.connect_state.profiles.len(), 2);
         app.update(Message::Connect(ConnectMessage::DeleteProfile("to-delete".into())));
@@ -5401,6 +5480,8 @@ mod tests {
             port: 22,
             username: "user".into(),
             auth: crate::core::connection::AuthMethod::Agent,
+            favorite: false,
+            jump_host: None,
         });
         app.connect_state.selected_profile = Some("srv".into());
         app.update(Message::Connect(ConnectMessage::DeleteProfile("srv".into())));
@@ -5479,7 +5560,7 @@ mod tests {
     #[test]
     fn b5_home_button_local() {
         let mut app = make_browser_app_with_entries();
-        let original_path = app.local_path.clone();
+        let _original_path = app.local_path.clone();
         app.update(Message::LocalPanel(PanelMessage::GoHome));
         let home = dirs::home_dir()
             .map(|p| p.to_string_lossy().to_string())

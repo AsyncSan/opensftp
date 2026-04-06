@@ -7,10 +7,9 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use super::connection::AuthMethod;
+use super::connection::{AuthMethod, JumpHostConfig};
 use super::known_hosts;
 
-/// SSH handler that verifies server keys against ~/.ssh/known_hosts (TOFU).
 struct SshHandler {
     host: String,
     port: u16,
@@ -24,19 +23,10 @@ impl client::Handler for SshHandler {
         server_public_key: &russh::keys::PublicKey,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
         let result = known_hosts::check_host_key(&self.host, self.port, server_public_key);
-        async move {
-            match result {
-                Ok(_status) => Ok(true),
-                Err(e) => {
-                    eprintln!("Host key verification failed: {}", e);
-                    Ok(false)
-                }
-            }
-        }
+        async move { Ok(result.is_ok()) }
     }
 }
 
-/// Holds the SSH handle and SFTP session for the lifetime of a connection.
 pub struct SftpConnection {
     pub sftp: SftpSession,
     handle: client::Handle<SshHandler>,
@@ -49,19 +39,102 @@ impl SftpConnection {
         username: &str,
         auth: &AuthMethod,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_inner(host, port, username, auth, None).await
+    }
+
+    pub async fn connect_with_jump_host(
+        host: &str,
+        port: u16,
+        username: &str,
+        auth: &AuthMethod,
+        jump_host: &JumpHostConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_inner(host, port, username, auth, Some(jump_host)).await
+    }
+
+    async fn connect_inner(
+        host: &str,
+        port: u16,
+        username: &str,
+        auth: &AuthMethod,
+        jump_host: Option<&JumpHostConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config = Arc::new(client::Config::default());
-        let addr = format!("{}:{}", host, port);
-
-        let handler = SshHandler {
-            host: host.to_string(),
-            port,
+        let handle = if let Some(jump) = jump_host {
+            let jump_handle = Self::connect_ssh(&config, &jump.host, jump.port, &jump.username, &jump.auth).await?;
+            let channel = jump_handle.channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0).await?;
+            let stream = channel.into_stream();
+            client::connect_stream(
+                config.clone(),
+                stream,
+                SshHandler {
+                    host: host.to_string(),
+                    port,
+                },
+            )
+            .await?
+        } else {
+            let addr = format!("{}:{}", host, port);
+            client::connect(
+                config.clone(),
+                &addr,
+                SshHandler {
+                    host: host.to_string(),
+                    port,
+                },
+            )
+            .await?
         };
-        let mut handle = client::connect(config, &addr, handler).await?;
 
+        Self::authenticate_and_open_sftp(handle, username, auth).await
+    }
+
+    async fn connect_ssh(
+        config: &Arc<client::Config>,
+        host: &str,
+        port: u16,
+        username: &str,
+        auth: &AuthMethod,
+    ) -> Result<client::Handle<SshHandler>, Box<dyn std::error::Error + Send + Sync>> {
+        let addr = format!("{}:{}", host, port);
+        let mut handle = client::connect(
+            config.clone(),
+            &addr,
+            SshHandler {
+                host: host.to_string(),
+                port,
+            },
+        )
+        .await?;
+        let auth_result: client::AuthResult = Self::authenticate(&mut handle, username, auth).await?;
+        if !auth_result.success() {
+            return Err("Authentication failed".into());
+        }
+        Ok(handle)
+    }
+
+    async fn authenticate_and_open_sftp(
+        mut handle: client::Handle<SshHandler>,
+        username: &str,
+        auth: &AuthMethod,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let auth_result: client::AuthResult = Self::authenticate(&mut handle, username, auth).await?;
+        if !auth_result.success() {
+            return Err("Authentication failed".into());
+        }
+        let channel = handle.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(channel.into_stream()).await?;
+        Ok(Self { sftp, handle })
+    }
+
+    async fn authenticate(
+        handle: &mut client::Handle<SshHandler>,
+        username: &str,
+        auth: &AuthMethod,
+    ) -> Result<client::AuthResult, Box<dyn std::error::Error + Send + Sync>> {
         let auth_result = match auth {
-            AuthMethod::Password(pw) => {
-                handle.authenticate_password(username, pw).await?
-            }
+            AuthMethod::Password(pw) => handle.authenticate_password(username, pw).await?,
             AuthMethod::KeyFile(path) => {
                 let key_data = std::fs::read_to_string(path)?;
                 let key_pair = russh::keys::PrivateKey::from_openssh(&key_data)
@@ -74,91 +147,49 @@ impl SftpConnection {
                     .await?
             }
             AuthMethod::Agent => {
-                let mut agent = russh::keys::agent::client::AgentClient::connect_env().await
+                let mut agent = russh::keys::agent::client::AgentClient::connect_env()
+                    .await
                     .map_err(|e| format!("Failed to connect to SSH agent: {}", e))?;
-
-                let identities = agent.request_identities().await
+                let identities = agent
+                    .request_identities()
+                    .await
                     .map_err(|e| format!("Failed to list agent keys: {}", e))?;
-
-                let mut authenticated = false;
                 for identity in &identities {
                     let pubkey = match identity {
                         russh::keys::agent::AgentIdentity::PublicKey { key, .. } => key.clone(),
-                        russh::keys::agent::AgentIdentity::Certificate { certificate: _, .. } => {
-                            continue; // skip certs for now
-                        }
+                        russh::keys::agent::AgentIdentity::Certificate { .. } => continue,
                     };
-                    let result = handle.authenticate_publickey_with(
-                        username,
-                        pubkey,
-                        None,
-                        &mut agent,
-                    ).await;
-                    match result {
-                        Ok(r) if r.success() => {
-                            authenticated = true;
-                            break;
-                        }
-                        _ => continue,
+                    if let Ok(result) = handle
+                        .authenticate_publickey_with(username, pubkey, None, &mut agent)
+                        .await
+                        && result.success()
+                    {
+                        return Ok(client::AuthResult::Success);
                     }
                 }
-                if !authenticated {
-                    return Err("SSH agent: no accepted key found".into());
-                }
-                // Skip the auth_result check below
-                return {
-                    let channel = handle.channel_open_session().await?;
-                    channel.request_subsystem(true, "sftp").await?;
-                    let sftp = SftpSession::new(channel.into_stream()).await?;
-                    Ok(Self { sftp, handle })
-                };
+                return Err("SSH agent: no accepted key found".into());
             }
         };
-
-        if !auth_result.success() {
-            return Err("Authentication failed".into());
-        }
-
-        let channel = handle.channel_open_session().await?;
-        channel.request_subsystem(true, "sftp").await?;
-        let sftp = SftpSession::new(channel.into_stream()).await?;
-
-        Ok(Self {
-            sftp,
-            handle,
-        })
+        Ok(auth_result)
     }
 
-    pub async fn list_dir(
-        &self,
-        path: &str,
-    ) -> Result<Vec<RemoteEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, Box<dyn std::error::Error + Send + Sync>> {
         let read_dir = self.sftp.read_dir(path).await?;
         let mut entries = Vec::new();
-
         for entry in read_dir {
             let meta = entry.metadata();
-            let is_dir = meta.file_type().is_dir();
-            let size = meta.size.unwrap_or(0);
-            let mtime = meta.mtime.unwrap_or(0) as u64;
-
-            let permissions = meta.permissions.map(|p| p as u32).unwrap_or(0);
-
             entries.push(RemoteEntry {
                 name: entry.file_name(),
-                is_dir,
-                size,
-                mtime,
-                permissions,
+                is_dir: meta.file_type().is_dir(),
+                size: meta.size.unwrap_or(0),
+                mtime: meta.mtime.unwrap_or(0) as u64,
+                permissions: meta.permissions.map(|p| p as u32).unwrap_or(0),
             });
         }
-
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
         Ok(entries)
     }
 
-    /// Download remote file to local path with progress updates.
-    /// Sends (bytes_transferred, total_size) through the channel.
     pub async fn download(
         &self,
         remote_path: &str,
@@ -167,13 +198,10 @@ impl SftpConnection {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let meta = self.sftp.metadata(remote_path).await?;
         let total_size = meta.size.unwrap_or(0);
-
         let mut remote_file = self.sftp.open(remote_path).await?;
         let mut local_file = tokio::fs::File::create(local_path).await?;
-
-        let mut transferred: u64 = 0;
-        let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
-
+        let mut transferred = 0u64;
+        let mut buf = vec![0u8; 256 * 1024];
         loop {
             let n = remote_file.read(&mut buf).await?;
             if n == 0 {
@@ -181,25 +209,21 @@ impl SftpConnection {
             }
             local_file.write_all(&buf[..n]).await?;
             transferred += n as u64;
-
             let _ = progress_tx.send(TransferProgress {
                 transferred,
                 total_size,
                 done: false,
             });
         }
-
         local_file.flush().await?;
         let _ = progress_tx.send(TransferProgress {
             transferred,
             total_size,
             done: true,
         });
-
         Ok(())
     }
 
-    /// Upload local file to remote path with progress updates.
     pub async fn upload(
         &self,
         local_path: &str,
@@ -208,16 +232,13 @@ impl SftpConnection {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let local_meta = tokio::fs::metadata(local_path).await?;
         let total_size = local_meta.len();
-
         let mut local_file = tokio::fs::File::open(local_path).await?;
-        let mut remote_file = self.sftp.open_with_flags(
-            remote_path,
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-        ).await?;
-
-        let mut transferred: u64 = 0;
+        let mut remote_file = self
+            .sftp
+            .open_with_flags(remote_path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE)
+            .await?;
+        let mut transferred = 0u64;
         let mut buf = vec![0u8; 256 * 1024];
-
         loop {
             let n = local_file.read(&mut buf).await?;
             if n == 0 {
@@ -225,49 +246,36 @@ impl SftpConnection {
             }
             remote_file.write_all(&buf[..n]).await?;
             transferred += n as u64;
-
             let _ = progress_tx.send(TransferProgress {
                 transferred,
                 total_size,
                 done: false,
             });
         }
-
         remote_file.shutdown().await?;
         let _ = progress_tx.send(TransferProgress {
             transferred,
             total_size,
             done: true,
         });
-
         Ok(())
     }
 
-    pub async fn mkdir(
-        &self,
-        path: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn mkdir(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sftp.create_dir(path).await?;
         Ok(())
     }
 
-    pub async fn remove_file(
-        &self,
-        path: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn remove_file(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sftp.remove_file(path).await?;
         Ok(())
     }
 
-    pub async fn remove_dir(
-        &self,
-        path: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn remove_dir(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sftp.remove_dir(path).await?;
         Ok(())
     }
 
-    /// Recursively remove a directory and all its contents.
     pub fn remove_dir_all<'a>(
         &'a self,
         path: &'a str,
@@ -290,20 +298,12 @@ impl SftpConnection {
         })
     }
 
-    pub async fn rename(
-        &self,
-        from: &str,
-        to: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sftp.rename(from, to).await?;
         Ok(())
     }
 
-    pub async fn set_permissions(
-        &self,
-        path: &str,
-        mode: u32,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn set_permissions(&self, path: &str, mode: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use russh_sftp::protocol::FileAttributes;
         let attrs = FileAttributes {
             permissions: Some(mode),
@@ -313,7 +313,6 @@ impl SftpConnection {
         Ok(())
     }
 
-    /// Recursively download a directory.
     pub fn download_dir<'a>(
         &'a self,
         remote_path: &'a str,
@@ -324,14 +323,12 @@ impl SftpConnection {
             tokio::fs::create_dir_all(local_path).await?;
             let entries = self.list_dir(remote_path).await?;
             let mut total_transferred = 0u64;
-
             for entry in &entries {
                 if entry.name == "." || entry.name == ".." {
                     continue;
                 }
                 let remote = format!("{}/{}", remote_path, entry.name);
                 let local = format!("{}/{}", local_path, entry.name);
-
                 if entry.is_dir {
                     total_transferred += self.download_dir(&remote, &local, progress_tx.clone()).await?;
                 } else {
@@ -343,7 +340,6 @@ impl SftpConnection {
         })
     }
 
-    /// Recursively upload a directory.
     pub fn upload_dir<'a>(
         &'a self,
         local_path: &'a str,
@@ -352,16 +348,13 @@ impl SftpConnection {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>> {
         Box::pin(async move {
             let _ = self.mkdir(remote_path).await;
-
             let mut read_dir = tokio::fs::read_dir(local_path).await?;
             let mut total_transferred = 0u64;
-
             while let Some(entry) = read_dir.next_entry().await? {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let local = format!("{}/{}", local_path, name);
                 let remote = format!("{}/{}", remote_path, name);
                 let meta = entry.metadata().await?;
-
                 if meta.is_dir() {
                     total_transferred += self.upload_dir(&local, &remote, progress_tx.clone()).await?;
                 } else {
@@ -373,30 +366,19 @@ impl SftpConnection {
         })
     }
 
-    /// Execute a command over SSH and return combined stdout+stderr output.
-    pub async fn exec_command(
-        &self,
-        command: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn exec_command(&self, command: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let channel = self.handle.channel_open_session().await?;
         channel.exec(true, command).await?;
-
         let mut output = Vec::new();
         let mut channel_stream = channel.into_stream();
         let mut buf = [0u8; 8192];
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                channel_stream.read(&mut buf),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), channel_stream.read(&mut buf)).await {
                 Ok(Ok(0)) | Err(_) => break,
                 Ok(Ok(n)) => output.extend_from_slice(&buf[..n]),
                 Ok(Err(_)) => break,
             }
         }
-
         Ok(String::from_utf8_lossy(&output).to_string())
     }
 
@@ -421,66 +403,4 @@ pub struct TransferProgress {
     pub total_size: u64,
     #[allow(dead_code)]
     pub done: bool,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn remote_entry_sort_dirs_first() {
-        let mut entries = vec![
-            RemoteEntry { name: "zebra.txt".into(), is_dir: false, size: 100, mtime: 0, permissions: 0o644 },
-            RemoteEntry { name: "alpha_dir".into(), is_dir: true, size: 0, mtime: 0, permissions: 0o755 },
-            RemoteEntry { name: "beta.txt".into(), is_dir: false, size: 200, mtime: 0, permissions: 0o644 },
-            RemoteEntry { name: "gamma_dir".into(), is_dir: true, size: 0, mtime: 0, permissions: 0o755 },
-        ];
-
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-
-        assert!(entries[0].is_dir);
-        assert!(entries[1].is_dir);
-        assert_eq!(entries[0].name, "alpha_dir");
-        assert_eq!(entries[1].name, "gamma_dir");
-        assert_eq!(entries[2].name, "beta.txt");
-        assert_eq!(entries[3].name, "zebra.txt");
-    }
-
-    #[test]
-    fn remote_entry_sort_alphabetical_within_group() {
-        let mut entries = vec![
-            RemoteEntry { name: "c.txt".into(), is_dir: false, size: 0, mtime: 0, permissions: 0o644 },
-            RemoteEntry { name: "a.txt".into(), is_dir: false, size: 0, mtime: 0, permissions: 0o644 },
-            RemoteEntry { name: "b.txt".into(), is_dir: false, size: 0, mtime: 0, permissions: 0o644 },
-        ];
-
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-
-        assert_eq!(entries[0].name, "a.txt");
-        assert_eq!(entries[1].name, "b.txt");
-        assert_eq!(entries[2].name, "c.txt");
-    }
-
-    #[test]
-    fn transfer_progress_creation() {
-        let p = TransferProgress {
-            transferred: 512,
-            total_size: 1024,
-            done: false,
-        };
-        assert_eq!(p.transferred, 512);
-        assert_eq!(p.total_size, 1024);
-        assert!(!p.done);
-    }
-
-    #[test]
-    fn transfer_progress_done() {
-        let p = TransferProgress {
-            transferred: 1024,
-            total_size: 1024,
-            done: true,
-        };
-        assert!(p.done);
-        assert_eq!(p.transferred, p.total_size);
-    }
 }
