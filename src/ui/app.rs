@@ -41,6 +41,8 @@ pub enum Message {
     // Transfer
     DownloadSelected,
     UploadSelected,
+    MoveDownload,
+    MoveUpload,
     TransferProgress(TransferProgress),
     TransferComplete(String),
     TransferFailed(String),
@@ -116,6 +118,8 @@ impl std::fmt::Debug for Message {
             Self::Disconnected => write!(f, "Disconnected"),
             Self::DownloadSelected => write!(f, "DownloadSelected"),
             Self::UploadSelected => write!(f, "UploadSelected"),
+            Self::MoveDownload => write!(f, "MoveDownload"),
+            Self::MoveUpload => write!(f, "MoveUpload"),
             Self::TransferProgress(p) => write!(f, "Progress({}/{})", p.transferred, p.total_size),
             Self::TransferComplete(s) => write!(f, "TransferComplete({})", s),
             Self::TransferFailed(e) => write!(f, "TransferFailed({})", e),
@@ -813,6 +817,94 @@ impl App {
                                 }
                             }
                             Ok(format!("Uploaded {} item(s)", count))
+                        });
+                    }
+                }
+            }
+
+            // Move: download remote -> local, then delete remote sources
+            Message::MoveDownload => {
+                if let Some(conn) = self.sftp.clone() {
+                    let items: Vec<(String, String, bool)> = self.remote_selected.iter()
+                        .filter_map(|&idx| self.remote_entries.get(idx))
+                        .filter(|e| e.name != "..")
+                        .map(|e| (
+                            format!("{}/{}", self.remote_path, e.name),
+                            format!("{}/{}", self.local_path, e.name),
+                            e.is_dir,
+                        ))
+                        .collect();
+
+                    if !items.is_empty() {
+                        let count = items.len();
+                        self.transfer_active = true;
+                        self.transfer_progress = 0.0;
+                        self.transfer_start = Some(Instant::now());
+                        self.transfer_bytes = 0;
+                        self.transfer_total = 0;
+                        self.transfer_status = format!("Moving {} item(s)...", count);
+
+                        return spawn_transfer(move |progress_tx| async move {
+                            for (remote_src, local_dst, is_dir) in &items {
+                                if *is_dir {
+                                    conn.download_dir(remote_src, local_dst, progress_tx.clone()).await?;
+                                } else {
+                                    conn.download(remote_src, local_dst, progress_tx.clone()).await?;
+                                }
+                            }
+                            // Delete remote sources after successful download
+                            for (remote_src, _, is_dir) in &items {
+                                if *is_dir {
+                                    conn.remove_dir_all(remote_src).await?;
+                                } else {
+                                    conn.remove_file(remote_src).await?;
+                                }
+                            }
+                            Ok(format!("Moved {} item(s)", count))
+                        });
+                    }
+                }
+            }
+
+            // Move: upload local -> remote, then delete local sources
+            Message::MoveUpload => {
+                if let Some(conn) = self.sftp.clone() {
+                    let items: Vec<(String, String, bool)> = self.local_selected.iter()
+                        .filter_map(|&idx| self.local_entries.get(idx))
+                        .filter(|e| e.name != "..")
+                        .map(|e| (
+                            format!("{}/{}", self.local_path, e.name),
+                            format!("{}/{}", self.remote_path, e.name),
+                            e.is_dir,
+                        ))
+                        .collect();
+
+                    if !items.is_empty() {
+                        let count = items.len();
+                        self.transfer_active = true;
+                        self.transfer_progress = 0.0;
+                        self.transfer_start = Some(Instant::now());
+                        self.transfer_bytes = 0;
+                        self.transfer_total = 0;
+                        self.transfer_status = format!("Moving {} item(s)...", count);
+
+                        return spawn_transfer(move |progress_tx| async move {
+                            for (local_src, remote_dst, is_dir) in &items {
+                                if *is_dir {
+                                    conn.upload_dir(local_src, remote_dst, progress_tx.clone()).await?;
+                                } else {
+                                    conn.upload(local_src, remote_dst, progress_tx.clone()).await?;
+                                }
+                            }
+                            // Delete local sources after successful upload
+                            for (local_src, _, is_dir) in &items {
+                                if *is_dir {
+                                    std::fs::remove_dir_all(local_src)?;
+                                } else {
+                                    std::fs::remove_file(local_src)?;
+                                }
+                            }
+                            Ok(format!("Moved {} item(s)", count))
                         });
                     }
                 }
@@ -1610,28 +1702,18 @@ impl App {
                     Key::Named(keyboard::key::Named::F4) => {
                         return self.update(Message::ToggleTerminal);
                     }
-                    // F5: Refresh both panels
+                    // F5: Copy selected to other panel (Norton Commander style)
                     Key::Named(keyboard::key::Named::F5) if !mods.control() => {
-                        self.local_entries = read_local_dir(&self.local_path, self.show_hidden);
-                        if let Some(conn) = self.sftp.clone() {
-                            let path = self.remote_path.clone();
-                            return Task::perform(
-                                async move {
-                                    let entries = conn.list_dir(&path).await?;
-                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, path))
-                                },
-                                |result| match result {
-                                    Ok((entries, path)) => Message::RemoteListing(entries, path),
-                                    Err(e) => Message::RemoteListingFailed(e.to_string()),
-                                },
-                            );
-                        }
-                    }
-                    // F6: Transfer selected (Upload or Download based on active panel)
-                    Key::Named(keyboard::key::Named::F6) => {
                         return match self.active_panel {
                             ActivePanel::Local => self.update(Message::UploadSelected),
                             ActivePanel::Remote => self.update(Message::DownloadSelected),
+                        };
+                    }
+                    // F6: Move selected to other panel (copy + delete source)
+                    Key::Named(keyboard::key::Named::F6) => {
+                        return match self.active_panel {
+                            ActivePanel::Local => self.update(Message::MoveUpload),
+                            ActivePanel::Remote => self.update(Message::MoveDownload),
                         };
                     }
                     // F7: New directory
@@ -2234,17 +2316,17 @@ impl App {
                                 .on_press(Message::ToggleTerminal)
                                 .padding([4, 8])
                                 .width(Length::FillPortion(1)),
-                            button(text("F5 Refresh").size(11))
-                                .on_press(match active {
-                                    ActivePanel::Local => Message::LocalPanel(PanelMessage::Refresh),
-                                    ActivePanel::Remote => Message::RemotePanel(PanelMessage::Refresh),
-                                })
-                                .padding([4, 8])
-                                .width(Length::FillPortion(1)),
-                            button(text("F6 Transfer").size(11))
+                            button(text("F5 Copy").size(11))
                                 .on_press(match active {
                                     ActivePanel::Local => Message::UploadSelected,
                                     ActivePanel::Remote => Message::DownloadSelected,
+                                })
+                                .padding([4, 8])
+                                .width(Length::FillPortion(1)),
+                            button(text("F6 Move").size(11))
+                                .on_press(match active {
+                                    ActivePanel::Local => Message::MoveUpload,
+                                    ActivePanel::Remote => Message::MoveDownload,
                                 })
                                 .padding([4, 8])
                                 .width(Length::FillPortion(1)),
