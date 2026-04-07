@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig1-dev libxkbcommon-dev \
+            libwayland-dev libvulkan-dev
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy -- -D warnings

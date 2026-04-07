@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: opensftp-linux-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: opensftp-macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: opensftp-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: opensftp-windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig1-dev libxkbcommon-dev \
+            libwayland-dev libvulkan-dev
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename artifact (unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cp target/${{ matrix.target }}/release/eurosftp ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+
+      - name: Rename artifact (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cp target/${{ matrix.target }}/release/eurosftp.exe ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la opensftp-*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "opensftp-*"
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | Linux | `opensftp-linux-x86_64` | Standalone binary, `chmod +x` and run |
+            | macOS (Apple Silicon) | `opensftp-macos-aarch64` | M1/M2/M3/M4, `chmod +x` and run |
+            | macOS (Intel) | `opensftp-macos-x86_64` | Intel Macs, `chmod +x` and run |
+            | Windows | `opensftp-windows-x86_64.exe` | Double-click to run |
+
+            ### Getting started
+            Download the binary for your platform, make it executable (`chmod +x` on macOS/Linux), and run it. No installation required.
