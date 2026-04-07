@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::core::sftp::{RemoteEntry, SftpConnection, TransferProgress};
 use crate::core::connection::JumpHostConfig;
-use crate::theme::AppTheme;
+use crate::theme::{AppTheme, InstallMode, Settings};
 use crate::ui::connect_dialog::{self, ConnectMessage, ConnectState};
 use crate::ui::file_panel::{self, FileEntry, PanelMessage, SortColumn};
 #[allow(unused_imports)]
@@ -101,6 +101,14 @@ pub enum Message {
     DismissContextMenu,
     // Keyboard
     KeyPressed(Key, Modifiers),
+    // First-run / Settings
+    FirstRunPortable,
+    FirstRunInstall,
+    OpenSettings,
+    CloseSettings,
+    SettingsSetInstallMode(InstallMode),
+    InstallComplete(Result<String, String>),
+    UninstallComplete(Result<String, String>),
 }
 
 impl std::fmt::Debug for Message {
@@ -169,6 +177,13 @@ impl std::fmt::Debug for Message {
             Self::ShowContextMenu(a) => write!(f, "ShowContextMenu({:?})", a),
             Self::DismissContextMenu => write!(f, "DismissContextMenu"),
             Self::KeyPressed(k, m) => write!(f, "KeyPressed({:?}, {:?})", k, m),
+            Self::FirstRunPortable => write!(f, "FirstRunPortable"),
+            Self::FirstRunInstall => write!(f, "FirstRunInstall"),
+            Self::OpenSettings => write!(f, "OpenSettings"),
+            Self::CloseSettings => write!(f, "CloseSettings"),
+            Self::SettingsSetInstallMode(m) => write!(f, "SettingsSetInstallMode({:?})", m),
+            Self::InstallComplete(r) => write!(f, "InstallComplete({:?})", r),
+            Self::UninstallComplete(r) => write!(f, "UninstallComplete({:?})", r),
         }
     }
 }
@@ -198,6 +213,8 @@ enum Dialog {
     SaveProfile(String),         // profile name
     ThemePicker,
     Chmod(String, String),       // (path, octal_value)
+    FirstRun,
+    Settings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +254,7 @@ struct TerminalEntry {
 pub struct App {
     screen: Screen,
     theme: AppTheme,
+    settings: Settings,
     connect_state: ConnectState,
     local_path: String,
     remote_path: String,
@@ -312,9 +330,19 @@ impl Default for App {
         let (demo_screen, demo_remote_path, demo_remote_entries, demo_status) = {
             (Screen::Connect, String::new(), Vec::new(), "Not connected".to_string())
         };
+        let settings = Settings::load();
+        let initial_dialog = if cfg!(test) {
+            Dialog::None
+        } else if settings.is_first_run() {
+            Dialog::FirstRun
+        } else {
+            Dialog::None
+        };
+
         Self {
             screen: demo_screen,
-            theme: AppTheme::load_saved(),
+            theme: settings.theme,
+            settings,
             connect_state: ConnectState::new(),
             local_path: home,
             remote_path: demo_remote_path,
@@ -334,7 +362,7 @@ impl Default for App {
             transfer_bytes: 0,
             transfer_total: 0,
             active_panel: ActivePanel::Local,
-            dialog: Dialog::None,
+            dialog: initial_dialog,
             show_hidden: false,
             show_bookmarks_bar: true,
             local_filter: String::new(),
@@ -1002,7 +1030,7 @@ impl App {
             }
 
             Message::OpenThemePicker => {
-                self.dialog = Dialog::ThemePicker;
+                self.dialog = Dialog::Settings;
             }
 
             Message::ThemeSelected(theme) => {
@@ -1600,6 +1628,61 @@ impl App {
                 }
             }
 
+            // First-run / Settings
+            Message::FirstRunPortable => {
+                self.settings.install_mode = Some(InstallMode::Portable);
+                self.settings.save();
+                self.dialog = Dialog::None;
+            }
+            Message::FirstRunInstall => {
+                self.settings.install_mode = Some(InstallMode::Installed);
+                self.settings.save();
+                self.dialog = Dialog::None;
+                return Task::perform(
+                    crate::core::desktop_integration::install(),
+                    Message::InstallComplete,
+                );
+            }
+            Message::OpenSettings => {
+                self.dialog = Dialog::Settings;
+            }
+            Message::CloseSettings => {
+                self.dialog = Dialog::None;
+            }
+            Message::SettingsSetInstallMode(mode) => {
+                let old_mode = self.settings.install_mode;
+                self.settings.install_mode = Some(mode);
+                self.settings.save();
+                match mode {
+                    InstallMode::Installed => {
+                        return Task::perform(
+                            crate::core::desktop_integration::install(),
+                            Message::InstallComplete,
+                        );
+                    }
+                    InstallMode::Portable => {
+                        if old_mode == Some(InstallMode::Installed) {
+                            return Task::perform(
+                                crate::core::desktop_integration::uninstall(),
+                                Message::UninstallComplete,
+                            );
+                        }
+                    }
+                }
+            }
+            Message::InstallComplete(result) => {
+                match result {
+                    Ok(msg) => self.status = msg,
+                    Err(e) => self.status = format!("Install failed: {e}"),
+                }
+            }
+            Message::UninstallComplete(result) => {
+                match result {
+                    Ok(msg) => self.status = msg,
+                    Err(e) => self.status = format!("Uninstall failed: {e}"),
+                }
+            }
+
             // Keyboard shortcuts
             Message::KeyPressed(key, mods) => {
                 self.modifiers = mods;
@@ -1959,12 +2042,12 @@ impl App {
                         .on_press(Message::ToggleHidden).padding([4, 8]),
                     button(text("Save").size(12))
                         .on_press(Message::SaveConnection).padding([4, 8]),
-                    button(text(format!("\u{1F3A8} {}", self.theme.name())).size(12))
-                        .on_press(Message::OpenThemePicker).padding([4, 8]),
                     button(text(if self.show_terminal { "Terminal \u{2713}" } else { "Terminal" }).size(12))
                         .on_press(Message::ToggleTerminal).padding([4, 8]),
                     button(text(format!("Log ({})", self.transfer_log.len())).size(12))
                         .on_press(Message::ToggleLog).padding([4, 8]),
+                    button(text("\u{2699} Settings").size(12))
+                        .on_press(Message::OpenSettings).padding([4, 8]),
                     button(text("Disconnect").size(12))
                         .on_press(Message::Disconnect).padding([4, 8]),
                 ]
@@ -1976,8 +2059,8 @@ impl App {
                 row![
                     text(&self.status).size(13),
                     iced::widget::horizontal_space(),
-                    button(text(format!("\u{1F3A8} {}", self.theme.name())).size(12))
-                        .on_press(Message::OpenThemePicker).padding([4, 8]),
+                    button(text("\u{2699} Settings").size(12))
+                        .on_press(Message::OpenSettings).padding([4, 8]),
                 ]
                 .spacing(4)
                 .align_y(iced::Alignment::Center),
@@ -2391,9 +2474,119 @@ impl App {
                         .into()
                 }
 
-                let content: Element<'_, Message> = if !is_browser {
-                    base_layout()
-                } else { match &self.dialog {
+                // Global dialogs (work on any screen)
+                let content: Element<'_, Message> = match &self.dialog {
+                    Dialog::FirstRun => {
+                        iced::widget::stack![
+                            base_layout(),
+                            wrap_dialog(column![
+                                text("Welcome to Open SFTP").size(20),
+                                text("How would you like to run the app?").size(13),
+                                container(
+                                    column![
+                                        button(
+                                            column![
+                                                text("Run Portable").size(14),
+                                                text("Just run the binary directly. No system integration.").size(11),
+                                            ].spacing(2)
+                                        )
+                                        .on_press(Message::FirstRunPortable)
+                                        .padding([12, 16])
+                                        .width(Length::Fill),
+                                        button(
+                                            column![
+                                                text("Add to Applications").size(14),
+                                                text("Create a desktop shortcut and menu entry for easy access.").size(11),
+                                            ].spacing(2)
+                                        )
+                                        .on_press(Message::FirstRunInstall)
+                                        .padding([12, 16])
+                                        .width(Length::Fill),
+                                    ].spacing(8)
+                                ).width(Length::Fill),
+                                text("You can change this later in Settings.").size(11),
+                            ].spacing(16).max_width(400).into()),
+                        ].into()
+                    }
+                    Dialog::Settings => {
+                        let current = self.theme;
+                        let is_installed = self.settings.install_mode == Some(InstallMode::Installed);
+
+                        let dark_themes: Vec<Element<'_, Message>> = AppTheme::all()
+                            .iter()
+                            .filter(|t| t.is_dark())
+                            .map(|&t| {
+                                let label = if t == current {
+                                    format!("\u{2713} {}", t.name())
+                                } else {
+                                    t.name().to_string()
+                                };
+                                button(text(label).size(12))
+                                    .on_press(Message::ThemeSelected(t))
+                                    .padding([4, 10])
+                                    .width(Length::Fill)
+                                    .into()
+                            })
+                            .collect();
+
+                        let light_themes: Vec<Element<'_, Message>> = AppTheme::all()
+                            .iter()
+                            .filter(|t| !t.is_dark())
+                            .map(|&t| {
+                                let label = if t == current {
+                                    format!("\u{2713} {}", t.name())
+                                } else {
+                                    t.name().to_string()
+                                };
+                                button(text(label).size(12))
+                                    .on_press(Message::ThemeSelected(t))
+                                    .padding([4, 10])
+                                    .width(Length::Fill)
+                                    .into()
+                            })
+                            .collect();
+
+                        iced::widget::stack![
+                            base_layout(),
+                            wrap_dialog(column![
+                                text("Settings").size(20),
+
+                                text("Theme").size(14),
+                                row![
+                                    column![
+                                        text("Dark").size(12),
+                                        scrollable(column(dark_themes).spacing(2)).height(Length::Fixed(220.0)),
+                                    ].spacing(4).width(Length::FillPortion(1)),
+                                    column![
+                                        text("Light").size(12),
+                                        scrollable(column(light_themes).spacing(2)).height(Length::Fixed(220.0)),
+                                    ].spacing(4).width(Length::FillPortion(1)),
+                                ].spacing(12),
+
+                                horizontal_rule(1),
+                                text("Installation").size(14),
+                                row![
+                                    button(text(if !is_installed { "\u{2713} Portable" } else { "Portable" }).size(12))
+                                        .on_press(Message::SettingsSetInstallMode(InstallMode::Portable))
+                                        .padding([6, 12]),
+                                    button(text(if is_installed { "\u{2713} Installed" } else { "Installed" }).size(12))
+                                        .on_press(Message::SettingsSetInstallMode(InstallMode::Installed))
+                                        .padding([6, 12]),
+                                ].spacing(8),
+                                text(if is_installed {
+                                    "App is registered in your system application menu."
+                                } else {
+                                    "Running as portable binary. No system integration."
+                                }).size(11),
+
+                                horizontal_rule(1),
+                                button("Close").on_press(Message::CloseSettings).padding([6, 16]),
+                            ].spacing(10).max_width(440).into()),
+                        ].into()
+                    }
+
+                    // Screen-specific dialogs (only in browser mode)
+                    _ if !is_browser => base_layout(),
                     Dialog::None => base_layout(),
                     Dialog::Mkdir(name) => {
                         iced::widget::stack![
@@ -2523,64 +2716,10 @@ impl App {
                         ].into()
                     }
                     Dialog::ThemePicker => {
-                        let current = self.theme;
-                        let dark_themes: Vec<Element<'_, Message>> = AppTheme::all()
-                            .iter()
-                            .filter(|t| t.is_dark())
-                            .map(|&t| {
-                                let label = if t == current {
-                                    format!("\u{2713} {}", t.name())
-                                } else {
-                                    t.name().to_string()
-                                };
-                                button(text(label).size(12))
-                                    .on_press(Message::ThemeSelected(t))
-                                    .padding([4, 10])
-                                    .width(Length::Fill)
-                                    .into()
-                            })
-                            .collect();
-
-                        let light_themes: Vec<Element<'_, Message>> = AppTheme::all()
-                            .iter()
-                            .filter(|t| !t.is_dark())
-                            .map(|&t| {
-                                let label = if t == current {
-                                    format!("\u{2713} {}", t.name())
-                                } else {
-                                    t.name().to_string()
-                                };
-                                button(text(label).size(12))
-                                    .on_press(Message::ThemeSelected(t))
-                                    .padding([4, 10])
-                                    .width(Length::Fill)
-                                    .into()
-                            })
-                            .collect();
-
-                        iced::widget::stack![
-                            base_layout(),
-                            wrap_dialog(column![
-                                text("Choose Theme").size(16),
-                                row![
-                                    column![
-                                        text("Dark").size(13),
-                                        scrollable(
-                                            column(dark_themes).spacing(2)
-                                        ).height(Length::Fixed(300.0)),
-                                    ].spacing(6).width(Length::FillPortion(1)),
-                                    column![
-                                        text("Light").size(13),
-                                        scrollable(
-                                            column(light_themes).spacing(2)
-                                        ).height(Length::Fixed(300.0)),
-                                    ].spacing(6).width(Length::FillPortion(1)),
-                                ].spacing(16),
-                                button("Close").on_press(Message::ThemeSelected(current)).padding(6),
-                            ].spacing(12).max_width(420).into()),
-                        ].into()
+                        // Legacy: now handled by Settings dialog
+                        base_layout()
                     }
-                }};
+                };
 
                 // Context menu overlay
                 let final_content: Element<'_, Message> = if is_browser && self.context_menu != ContextMenu::None {
@@ -5253,7 +5392,7 @@ mod tests {
         let mut app = App::default();
         app.screen = Screen::Browser;
         app.update(Message::OpenThemePicker);
-        assert_eq!(app.dialog, Dialog::ThemePicker);
+        assert_eq!(app.dialog, Dialog::Settings);
     }
 
     #[test]

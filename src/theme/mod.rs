@@ -2,6 +2,69 @@ use iced::Theme;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// ── Install mode ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstallMode {
+    Portable,
+    Installed,
+}
+
+// ── Settings ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    pub theme: AppTheme,
+    #[serde(default)]
+    pub install_mode: Option<InstallMode>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: AppTheme::default(),
+            install_mode: None,
+        }
+    }
+}
+
+impl Settings {
+    pub fn settings_path() -> PathBuf {
+        let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        p.push("eurosftp");
+        p.push("settings.json");
+        p
+    }
+
+    pub fn exists() -> bool {
+        Self::settings_path().exists()
+    }
+
+    pub fn load() -> Self {
+        let path = Self::settings_path();
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let path = Self::settings_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    pub fn is_first_run(&self) -> bool {
+        self.install_mode.is_none()
+    }
+}
+
+// ── Theme ────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppTheme {
     Dark,
@@ -112,37 +175,17 @@ impl AppTheme {
         )
     }
 
-    fn settings_path() -> PathBuf {
-        let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        p.push("eurosftp");
-        p.push("settings.json");
-        p
-    }
-
+    /// Load theme from saved settings (convenience for backward compat).
     pub fn load_saved() -> Self {
-        let path = Self::settings_path();
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
-            .map(|s| s.theme)
-            .unwrap_or_default()
+        Settings::load().theme
     }
 
+    /// Save theme to settings (preserves other settings fields).
     pub fn save(&self) {
-        let path = Self::settings_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let settings = Settings { theme: *self };
-        if let Ok(json) = serde_json::to_string_pretty(&settings) {
-            let _ = std::fs::write(&path, json);
-        }
+        let mut settings = Settings::load();
+        settings.theme = *self;
+        settings.save();
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Settings {
-    theme: AppTheme,
 }
 
 #[cfg(test)]
@@ -208,10 +251,31 @@ mod tests {
 
     #[test]
     fn settings_roundtrip() {
-        let settings = Settings { theme: AppTheme::TokyoNight };
+        let settings = Settings {
+            theme: AppTheme::TokyoNight,
+            install_mode: Some(InstallMode::Installed),
+        };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let restored: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.theme, AppTheme::TokyoNight);
+        assert_eq!(restored.install_mode, Some(InstallMode::Installed));
+    }
+
+    #[test]
+    fn settings_backward_compat() {
+        // Old settings.json with only theme field
+        let json = r#"{"theme":"Dark"}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.theme, AppTheme::Dark);
+        assert_eq!(settings.install_mode, None);
+        assert!(settings.is_first_run());
+    }
+
+    #[test]
+    fn settings_default_is_first_run() {
+        let settings = Settings::default();
+        assert!(settings.is_first_run());
+        assert_eq!(settings.install_mode, None);
     }
 
     #[test]
@@ -223,8 +287,16 @@ mod tests {
 
     #[test]
     fn settings_path_correct() {
-        let path = AppTheme::settings_path();
+        let path = Settings::settings_path();
         assert!(path.to_string_lossy().contains("eurosftp"));
         assert!(path.to_string_lossy().ends_with("settings.json"));
+    }
+
+    #[test]
+    fn install_mode_serialize() {
+        let json = serde_json::to_string(&InstallMode::Portable).unwrap();
+        assert_eq!(json, "\"Portable\"");
+        let json = serde_json::to_string(&InstallMode::Installed).unwrap();
+        assert_eq!(json, "\"Installed\"");
     }
 }
