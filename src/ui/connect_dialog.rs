@@ -1,5 +1,6 @@
 use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{Element, Length, Theme};
+use super::icons;
 
 use crate::core::connection::{AuthMethod, ConnectionProfile, JumpHostConfig};
 
@@ -226,16 +227,23 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
     let profile_names: Vec<String> = state.profiles.iter().map(|p| p.name.clone()).collect();
 
     let quick_cards: Vec<Element<'_, ConnectMessage>> = state.profiles.iter().map(|p| {
-        let auth_label = match &p.auth {
-            AuthMethod::Password(_) => "[pw]",
-            AuthMethod::KeyFile(_) => "[key]",
-            AuthMethod::Agent => "[agent]",
+        let auth_icon: Element<'_, ConnectMessage> = match &p.auth {
+            AuthMethod::Password(_) => icons::lock(11.0).into(),
+            AuthMethod::KeyFile(_) => icons::key(11.0).into(),
+            AuthMethod::Agent => icons::user(11.0).into(),
         };
         let name = p.name.clone();
         let delete_name = p.name.clone();
         let favorite_name = p.name.clone();
-        let favorite_label = if p.favorite { "*" } else { "." };
-        container(row![button(text(favorite_label).size(11)).on_press(ConnectMessage::ToggleFavorite(favorite_name)).padding([8, 6]), button(column![text(&p.name).size(13), text(format!("{} {}@{}:{}", auth_label, p.username, p.host, p.port)).size(11)]).on_press(ConnectMessage::QuickConnect(name)).padding([8, 12]).width(Length::Fill), button(text("x").size(11)).on_press(ConnectMessage::DeleteProfile(delete_name)).padding([8, 6]),].spacing(2).align_y(iced::Alignment::Center),).width(Length::Fill).style(|theme: &Theme| container::Style { background: Some(iced::Background::Color(iced::Color { a: 0.2, ..theme.extended_palette().background.strong.color })), border: iced::Border { color: theme.extended_palette().primary.weak.color, width: 1.0, radius: 6.0.into(), }, ..Default::default() }).into()
+        let fav_icon: Element<'_, ConnectMessage> = if p.favorite { icons::star(11.0).into() } else { icons::star_empty(11.0).into() };
+        container(row![
+            button(fav_icon).on_press(ConnectMessage::ToggleFavorite(favorite_name)).padding([8, 6]),
+            button(column![
+                text(&p.name).size(13),
+                row![auth_icon, text(format!(" {}@{}:{}", p.username, p.host, p.port)).size(11)].spacing(2).align_y(iced::Alignment::Center),
+            ]).on_press(ConnectMessage::QuickConnect(name)).padding([8, 12]).width(Length::Fill),
+            button(icons::x(11.0)).on_press(ConnectMessage::DeleteProfile(delete_name)).padding([8, 6]),
+        ].spacing(2).align_y(iced::Alignment::Center)).width(Length::Fill).style(|theme: &Theme| container::Style { background: Some(iced::Background::Color(iced::Color { a: 0.2, ..theme.extended_palette().background.strong.color })), border: iced::Border { color: theme.extended_palette().primary.weak.color, width: 1.0, radius: 6.0.into(), }, ..Default::default() }).into()
     }).collect();
 
     let quick_connect_section: Element<'_, ConnectMessage> = if quick_cards.is_empty() { container(text("")).height(Length::Shrink).into() } else { column![text("Quick Connect").size(13), iced::widget::scrollable(column(quick_cards).spacing(4),).height(Length::Shrink),].spacing(6).into() };

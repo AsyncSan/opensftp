@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,6 +8,7 @@ use iced::widget::{button, column, container, horizontal_rule, progress_bar, row
 use iced::{Element, Length, Subscription, Task, Theme};
 use iced::futures::stream;
 use tokio::sync::mpsc;
+use super::icons;
 
 use crate::core::sftp::{RemoteEntry, SftpConnection, TransferProgress};
 use crate::core::connection::JumpHostConfig;
@@ -101,6 +103,11 @@ pub enum Message {
     DismissContextMenu,
     // Keyboard
     KeyPressed(Key, Modifiers),
+    // Drag and drop / file picker
+    FilesDropped(Vec<PathBuf>),
+    DragHovering(bool),
+    BrowseUpload,
+    BrowseUploadChosen(Vec<PathBuf>),
     // First-run / Settings
     FirstRunPortable,
     FirstRunInstall,
@@ -177,6 +184,10 @@ impl std::fmt::Debug for Message {
             Self::ShowContextMenu(a) => write!(f, "ShowContextMenu({:?})", a),
             Self::DismissContextMenu => write!(f, "DismissContextMenu"),
             Self::KeyPressed(k, m) => write!(f, "KeyPressed({:?}, {:?})", k, m),
+            Self::FilesDropped(p) => write!(f, "FilesDropped({} files)", p.len()),
+            Self::DragHovering(h) => write!(f, "DragHovering({})", h),
+            Self::BrowseUpload => write!(f, "BrowseUpload"),
+            Self::BrowseUploadChosen(p) => write!(f, "BrowseUploadChosen({} files)", p.len()),
             Self::FirstRunPortable => write!(f, "FirstRunPortable"),
             Self::FirstRunInstall => write!(f, "FirstRunInstall"),
             Self::OpenSettings => write!(f, "OpenSettings"),
@@ -300,6 +311,9 @@ pub struct App {
     terminal_running: bool,
     terminal_cmd_history: Vec<String>,
     terminal_history_idx: Option<usize>,
+    // Drag and drop
+    drop_hovering: bool,
+    drop_pending: Vec<PathBuf>,
 }
 
 impl Default for App {
@@ -381,6 +395,8 @@ impl Default for App {
             terminal_running: false,
             terminal_cmd_history: Vec::new(),
             terminal_history_idx: None,
+            drop_hovering: false,
+            drop_pending: Vec::new(),
         }
     }
 }
@@ -991,9 +1007,11 @@ impl App {
 
                 // Refresh both panels
                 self.local_entries = read_local_dir(&self.local_path, self.show_hidden);
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+
                 if let Some(conn) = self.sftp.clone() {
                     let path = self.remote_path.clone();
-                    return Task::perform(
+                    tasks.push(Task::perform(
                         async move {
                             let entries = conn.list_dir(&path).await?;
                             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((entries, path))
@@ -1002,7 +1020,17 @@ impl App {
                             Ok((entries, path)) => Message::RemoteListing(entries, path),
                             Err(e) => Message::RemoteListingFailed(e.to_string()),
                         },
-                    );
+                    ));
+                }
+
+                // Process queued drop files
+                if !self.drop_pending.is_empty() {
+                    let pending = std::mem::take(&mut self.drop_pending);
+                    tasks.push(Task::done(Message::FilesDropped(pending)));
+                }
+
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
                 }
             }
 
@@ -1710,6 +1738,89 @@ impl App {
                 }
             }
 
+            // Drag and drop: collect files, then batch-upload
+            Message::DragHovering(hovering) => {
+                self.drop_hovering = hovering;
+            }
+            Message::FilesDropped(paths) => {
+                self.drop_hovering = false;
+
+                // Guard: transfer already running, queue into pending
+                if self.transfer_active {
+                    self.drop_pending.extend(paths);
+                    self.status = format!("{} file(s) queued, waiting for current transfer...", self.drop_pending.len());
+                    return Task::none();
+                }
+
+                // Guard: not connected or not in browser
+                if self.screen != Screen::Browser || self.sftp.is_none() {
+                    self.status = "Connect to a server before dropping files".to_string();
+                    return Task::none();
+                }
+
+                // Merge any pending files with this batch
+                let mut all_paths = std::mem::take(&mut self.drop_pending);
+                all_paths.extend(paths);
+
+                if let Some(conn) = self.sftp.clone() {
+                    let items: Vec<(String, String, bool)> = all_paths.iter()
+                        .filter_map(|p| {
+                            let name = p.file_name()?.to_string_lossy().to_string();
+                            let is_dir = p.is_dir();
+                            let local_src = p.to_string_lossy().to_string();
+                            let remote_dst = format!("{}/{}", self.remote_path, name);
+                            Some((local_src, remote_dst, is_dir))
+                        })
+                        .collect();
+
+                    if !items.is_empty() {
+                        let count = items.len();
+                        self.transfer_active = true;
+                        self.transfer_progress = 0.0;
+                        self.transfer_start = Some(Instant::now());
+                        self.transfer_bytes = 0;
+                        self.transfer_total = 0;
+                        self.transfer_status = format!("Uploading {} dropped item(s)...", count);
+
+                        return spawn_transfer(move |progress_tx| async move {
+                            for (local_src, remote_dst, is_dir) in &items {
+                                if *is_dir {
+                                    conn.upload_dir(local_src, remote_dst, progress_tx.clone()).await?;
+                                } else {
+                                    conn.upload(local_src, remote_dst, progress_tx.clone()).await?;
+                                }
+                            }
+                            Ok(format!("Uploaded {} dropped item(s)", count))
+                        });
+                    }
+                }
+            }
+            Message::BrowseUpload => {
+                if self.screen != Screen::Browser || self.sftp.is_none() {
+                    self.status = "Connect to a server before uploading files".to_string();
+                    return Task::none();
+                }
+                return Task::perform(
+                    async {
+                        let handles = rfd::AsyncFileDialog::new()
+                            .set_title("Select files to upload")
+                            .pick_files()
+                            .await;
+                        handles
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|h| h.path().to_path_buf())
+                            .collect::<Vec<_>>()
+                    },
+                    Message::BrowseUploadChosen,
+                );
+            }
+            Message::BrowseUploadChosen(paths) => {
+                if !paths.is_empty() {
+                    return self.update(Message::FilesDropped(paths));
+                }
+            }
+
             // Keyboard shortcuts
             Message::KeyPressed(key, mods) => {
                 self.modifiers = mods;
@@ -2069,11 +2180,11 @@ impl App {
                         .on_press(Message::ToggleHidden).padding([4, 8]),
                     button(text("Save").size(12))
                         .on_press(Message::SaveConnection).padding([4, 8]),
-                    button(text(if self.show_terminal { "[x] Terminal" } else { "Terminal" }).size(12))
+                    button(row![icons::terminal(12.0), text(if self.show_terminal { " Terminal [x]" } else { " Terminal" }).size(12)].align_y(iced::Alignment::Center))
                         .on_press(Message::ToggleTerminal).padding([4, 8]),
                     button(text(format!("Log ({})", self.transfer_log.len())).size(12))
                         .on_press(Message::ToggleLog).padding([4, 8]),
-                    button(text("Settings").size(12))
+                    button(row![icons::settings(12.0), text(" Settings").size(12)].align_y(iced::Alignment::Center))
                         .on_press(Message::OpenSettings).padding([4, 8]),
                     button(text("Disconnect").size(12))
                         .on_press(Message::Disconnect).padding([4, 8]),
@@ -2086,7 +2197,7 @@ impl App {
                 row![
                     text(&self.status).size(13),
                     iced::widget::horizontal_space(),
-                    button(text("Settings").size(12))
+                    button(row![icons::settings(12.0), text(" Settings").size(12)].align_y(iced::Alignment::Center))
                         .on_press(Message::OpenSettings).padding([4, 8]),
                 ]
                 .spacing(4)
@@ -2178,14 +2289,21 @@ impl App {
                         .any(|&idx| self.remote_entries.get(idx).map_or(false, |e| e.name != ".."))
                     && !self.transfer_active;
 
-                let mut upload_btn = button(text("Upload >>").size(12)).padding([6, 14]);
+                let mut upload_btn = button(row![icons::upload(12.0), text(" Upload").size(12)].align_y(iced::Alignment::Center)).padding([6, 14]);
                 if can_upload { upload_btn = upload_btn.on_press(Message::UploadSelected); }
 
-                let mut download_btn = button(text("<< Download").size(12)).padding([6, 14]);
+                let mut download_btn = button(row![icons::download(12.0), text(" Download").size(12)].align_y(iced::Alignment::Center)).padding([6, 14]);
                 if can_download { download_btn = download_btn.on_press(Message::DownloadSelected); }
 
+                let mut browse_btn = button(
+                    row![icons::folder(12.0), text(" Browse...").size(12)].align_y(iced::Alignment::Center)
+                ).padding([6, 14]);
+                if !self.transfer_active {
+                    browse_btn = browse_btn.on_press(Message::BrowseUpload);
+                }
+
                 let transfer_controls = container(
-                    column![upload_btn, download_btn]
+                    column![upload_btn, browse_btn, download_btn]
                         .spacing(12)
                         .align_x(iced::Alignment::Center),
                 )
@@ -2593,10 +2711,10 @@ impl App {
                                 horizontal_rule(1),
                                 text("Installation").size(14),
                                 row![
-                                    button(text(if !is_installed { "[x] Portable" } else { "Portable" }).size(12))
+                                    button(if !is_installed { row![icons::check(12.0), text(" Portable").size(12)].align_y(iced::Alignment::Center) } else { row![text("Portable").size(12)] })
                                         .on_press(Message::SettingsSetInstallMode(InstallMode::Portable))
                                         .padding([6, 12]),
-                                    button(text(if is_installed { "[x] Installed" } else { "Installed" }).size(12))
+                                    button(if is_installed { row![icons::check(12.0), text(" Installed").size(12)].align_y(iced::Alignment::Center) } else { row![text("Installed").size(12)] })
                                         .on_press(Message::SettingsSetInstallMode(InstallMode::Installed))
                                         .padding([6, 12]),
                                 ].spacing(8),
@@ -2771,10 +2889,10 @@ impl App {
                     };
 
                     let is_dotdot = entry_name == "..";
-                    let icon = if is_dir { "[D]" } else { " - " };
+                    let icon_widget: Element<'_, Message> = if is_dir { icons::folder(13.0).into() } else { icons::file(13.0).into() };
 
                     let mut menu_items: Vec<Element<'_, Message>> = vec![
-                        text(format!("{} {}", icon, entry_name)).size(13).into(),
+                        row![icon_widget, text(format!(" {}", entry_name)).size(13)].spacing(4).align_y(iced::Alignment::Center).into(),
                         horizontal_rule(1).into(),
                     ];
 
@@ -2791,7 +2909,7 @@ impl App {
                     if !is_dotdot {
                         if is_local {
                             menu_items.push(
-                                button(text("Upload >>").size(12))
+                                button(row![icons::upload(12.0), text(" Upload").size(12)].align_y(iced::Alignment::Center))
                                     .on_press(Message::ShowContextMenu(ContextAction::Upload))
                                     .padding([4, 12])
                                     .width(Length::Fill)
@@ -2799,7 +2917,7 @@ impl App {
                             );
                         } else {
                             menu_items.push(
-                                button(text("<< Download").size(12))
+                                button(row![icons::download(12.0), text(" Download").size(12)].align_y(iced::Alignment::Center))
                                     .on_press(Message::ShowContextMenu(ContextAction::Download))
                                     .padding([4, 12])
                                     .width(Length::Fill)
@@ -2904,6 +3022,43 @@ impl App {
                         backdrop,
                         menu_overlay,
                     ].into()
+                } else if self.drop_hovering {
+                    let (label, accent) = if !is_browser || self.sftp.is_none() {
+                        ("Connect to a server first", iced::Color::from_rgb(0.8, 0.3, 0.3))
+                    } else if self.transfer_active {
+                        ("Drop to queue upload", iced::Color::from_rgb(1.0, 0.7, 0.0))
+                    } else {
+                        ("Drop files to upload", iced::Color::from_rgb(0.0, 0.5, 1.0))
+                    };
+
+                    let drop_overlay = container(
+                        column![
+                            icons::upload(32.0),
+                            text(label).size(16),
+                        ]
+                        .spacing(8)
+                        .align_x(iced::Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(iced::Background::Color(iced::Color {
+                            r: accent.r, g: accent.g, b: accent.b, a: 0.15,
+                        })),
+                        border: iced::Border {
+                            color: accent,
+                            width: 2.0,
+                            radius: 8.0.into(),
+                        },
+                        ..Default::default()
+                    });
+
+                    iced::widget::stack![
+                        content,
+                        drop_overlay,
+                    ].into()
                 } else {
                     content
                 };
@@ -2919,9 +3074,27 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        keyboard::on_key_press(|key, modifiers| {
+        let keys = keyboard::on_key_press(|key, modifiers| {
             Some(Message::KeyPressed(key, modifiers))
-        })
+        });
+
+        let drops = iced::event::listen_with(|event, _status, _id| {
+            match event {
+                iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+                    Some(Message::FilesDropped(vec![path]))
+                }
+                iced::Event::Window(iced::window::Event::FileHovered(_)) => {
+                    Some(Message::DragHovering(true))
+                }
+                iced::Event::Window(iced::window::Event::FilesHoveredLeft)
+                | iced::Event::Window(iced::window::Event::Unfocused) => {
+                    Some(Message::DragHovering(false))
+                }
+                _ => None,
+            }
+        });
+
+        Subscription::batch([keys, drops])
     }
 }
 
@@ -5853,5 +6026,70 @@ mod tests {
         if let Dialog::Chmod(_, ref octal) = app.dialog {
             assert_eq!(octal, "644");
         }
+    }
+
+    // --- Drag & Drop Tests ---
+
+    #[test]
+    fn dnd_hover_sets_flag() {
+        let mut app = App::default();
+        assert!(!app.drop_hovering);
+        app.update(Message::DragHovering(true));
+        assert!(app.drop_hovering);
+        app.update(Message::DragHovering(false));
+        assert!(!app.drop_hovering);
+    }
+
+    #[test]
+    fn dnd_drop_clears_hover() {
+        let mut app = make_browser_app_with_entries();
+        app.drop_hovering = true;
+        app.update(Message::FilesDropped(vec![PathBuf::from("/tmp/test.txt")]));
+        assert!(!app.drop_hovering);
+    }
+
+    #[test]
+    fn dnd_drop_without_connection_shows_status() {
+        let mut app = make_browser_app_with_entries();
+        // No sftp connection set (default)
+        app.update(Message::FilesDropped(vec![PathBuf::from("/tmp/test.txt")]));
+        assert!(app.status.contains("Connect to a server"));
+        assert!(!app.transfer_active);
+    }
+
+    #[test]
+    fn dnd_drop_on_connect_screen_shows_status() {
+        let mut app = App::default();
+        app.screen = Screen::Connect;
+        app.update(Message::FilesDropped(vec![PathBuf::from("/tmp/test.txt")]));
+        assert!(app.status.contains("Connect to a server"));
+        assert!(!app.transfer_active);
+    }
+
+    #[test]
+    fn dnd_drop_during_transfer_queues_files() {
+        let mut app = make_browser_app_with_entries();
+        app.transfer_active = true;
+        let paths = vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")];
+        app.update(Message::FilesDropped(paths));
+        assert_eq!(app.drop_pending.len(), 2);
+        assert!(app.status.contains("queued"));
+    }
+
+    #[test]
+    fn dnd_multiple_queued_batches_accumulate() {
+        let mut app = make_browser_app_with_entries();
+        app.transfer_active = true;
+        app.update(Message::FilesDropped(vec![PathBuf::from("/tmp/a.txt")]));
+        app.update(Message::FilesDropped(vec![PathBuf::from("/tmp/b.txt")]));
+        assert_eq!(app.drop_pending.len(), 2);
+    }
+
+    #[test]
+    fn dnd_hover_visible_on_any_screen() {
+        let mut app = App::default();
+        app.screen = Screen::Connect;
+        app.update(Message::DragHovering(true));
+        assert!(app.drop_hovering);
     }
 }

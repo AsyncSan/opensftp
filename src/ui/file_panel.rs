@@ -1,5 +1,6 @@
 use iced::widget::{column, container, mouse_area, row, scrollable, text, text_input, button, horizontal_space};
 use iced::{Element, Length, Alignment, Theme};
+use super::icons;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -161,8 +162,8 @@ pub fn view_panel<'a>(
 ) -> Element<'a, PanelMessage> {
     // Clickable breadcrumbs
     let mut breadcrumbs = row![
-        button(text("<").size(12)).on_press(PanelMessage::GoUp).padding([2, 6]),
-        button(text("~").size(12)).on_press(PanelMessage::GoHome).padding([2, 6]),
+        button(icons::arrow_left(12.0)).on_press(PanelMessage::GoUp).padding([2, 6]),
+        button(icons::home(12.0)).on_press(PanelMessage::GoHome).padding([2, 6]),
     ]
     .spacing(1)
     .align_y(Alignment::Center);
@@ -184,7 +185,7 @@ pub fn view_panel<'a>(
     }
     breadcrumbs = breadcrumbs.push(horizontal_space());
     breadcrumbs = breadcrumbs.push(
-        button(text("R").size(12)).on_press(PanelMessage::Refresh).padding([2, 6]),
+        button(icons::refresh(12.0)).on_press(PanelMessage::Refresh).padding([2, 6]),
     );
 
     let header = breadcrumbs;
@@ -232,12 +233,13 @@ pub fn view_panel<'a>(
         })
         .enumerate()
         .map(|(visual_idx, (i, entry))| {
-            let icon = if entry.is_dir { "[D]" } else { " - " };
+            let icon_widget = if entry.is_dir { icons::folder(12.0) } else { icons::file(12.0) };
             let r = button(
                 row![
-                    text(format!("{} {}", icon, entry.name))
-                        .size(12)
-                        .width(Length::FillPortion(4)),
+                    row![
+                        icon_widget,
+                        text(&entry.name).size(12),
+                    ].spacing(4).width(Length::FillPortion(4)),
                     text(&entry.permissions)
                         .size(11)
                         .width(Length::FillPortion(1)),
