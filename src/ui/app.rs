@@ -497,6 +497,33 @@ impl App {
                 self.remote_path = home;
                 self.remote_entries = remote_to_file_entries(&entries, self.show_hidden);
                 self.connected_at = Some(Instant::now());
+
+                // Auto-save connection profile
+                {
+                    use crate::core::connection::ConnectionProfile;
+                    let host = &self.connect_state.host;
+                    let username = &self.connect_state.username;
+                    let port: u16 = self.connect_state.port.parse().unwrap_or(22);
+                    let auto_name = format!("{}@{}", username, host);
+                    let profile = ConnectionProfile {
+                        name: auto_name.clone(),
+                        host: host.clone(),
+                        port,
+                        username: username.clone(),
+                        auth: self.connect_state.auth_method(),
+                        favorite: false,
+                        jump_host: self.connect_state.jump_host_config(),
+                    };
+                    let mut profiles = self.connect_state.profiles.clone();
+                    if let Some(existing) = profiles.iter_mut().find(|p| p.host == *host && p.username == *username && p.port == port) {
+                        existing.auth = profile.auth;
+                        existing.jump_host = profile.jump_host;
+                    } else {
+                        profiles.push(profile);
+                    }
+                    let _ = ConnectionProfile::save_all(&profiles);
+                    self.connect_state.profiles = profiles;
+                }
             }
 
             Message::ConnectionFailed(err) => {
@@ -2042,11 +2069,11 @@ impl App {
                         .on_press(Message::ToggleHidden).padding([4, 8]),
                     button(text("Save").size(12))
                         .on_press(Message::SaveConnection).padding([4, 8]),
-                    button(text(if self.show_terminal { "Terminal \u{2713}" } else { "Terminal" }).size(12))
+                    button(text(if self.show_terminal { "[x] Terminal" } else { "Terminal" }).size(12))
                         .on_press(Message::ToggleTerminal).padding([4, 8]),
                     button(text(format!("Log ({})", self.transfer_log.len())).size(12))
                         .on_press(Message::ToggleLog).padding([4, 8]),
-                    button(text("\u{2699} Settings").size(12))
+                    button(text("Settings").size(12))
                         .on_press(Message::OpenSettings).padding([4, 8]),
                     button(text("Disconnect").size(12))
                         .on_press(Message::Disconnect).padding([4, 8]),
@@ -2059,7 +2086,7 @@ impl App {
                 row![
                     text(&self.status).size(13),
                     iced::widget::horizontal_space(),
-                    button(text("\u{2699} Settings").size(12))
+                    button(text("Settings").size(12))
                         .on_press(Message::OpenSettings).padding([4, 8]),
                 ]
                 .spacing(4)
@@ -2151,10 +2178,10 @@ impl App {
                         .any(|&idx| self.remote_entries.get(idx).map_or(false, |e| e.name != ".."))
                     && !self.transfer_active;
 
-                let mut upload_btn = button(text("Upload \u{25B6}").size(12)).padding([6, 14]);
+                let mut upload_btn = button(text("Upload >>").size(12)).padding([6, 14]);
                 if can_upload { upload_btn = upload_btn.on_press(Message::UploadSelected); }
 
-                let mut download_btn = button(text("\u{25C0} Download").size(12)).padding([6, 14]);
+                let mut download_btn = button(text("<< Download").size(12)).padding([6, 14]);
                 if can_download { download_btn = download_btn.on_press(Message::DownloadSelected); }
 
                 let transfer_controls = container(
@@ -2517,9 +2544,9 @@ impl App {
                             .filter(|t| t.is_dark())
                             .map(|&t| {
                                 let label = if t == current {
-                                    format!("\u{2713} {}", t.name())
+                                    format!("> {}", t.name())
                                 } else {
-                                    t.name().to_string()
+                                    format!("  {}", t.name())
                                 };
                                 button(text(label).size(12))
                                     .on_press(Message::ThemeSelected(t))
@@ -2534,9 +2561,9 @@ impl App {
                             .filter(|t| !t.is_dark())
                             .map(|&t| {
                                 let label = if t == current {
-                                    format!("\u{2713} {}", t.name())
+                                    format!("> {}", t.name())
                                 } else {
-                                    t.name().to_string()
+                                    format!("  {}", t.name())
                                 };
                                 button(text(label).size(12))
                                     .on_press(Message::ThemeSelected(t))
@@ -2566,10 +2593,10 @@ impl App {
                                 horizontal_rule(1),
                                 text("Installation").size(14),
                                 row![
-                                    button(text(if !is_installed { "\u{2713} Portable" } else { "Portable" }).size(12))
+                                    button(text(if !is_installed { "[x] Portable" } else { "Portable" }).size(12))
                                         .on_press(Message::SettingsSetInstallMode(InstallMode::Portable))
                                         .padding([6, 12]),
-                                    button(text(if is_installed { "\u{2713} Installed" } else { "Installed" }).size(12))
+                                    button(text(if is_installed { "[x] Installed" } else { "Installed" }).size(12))
                                         .on_press(Message::SettingsSetInstallMode(InstallMode::Installed))
                                         .padding([6, 12]),
                                 ].spacing(8),
@@ -2744,7 +2771,7 @@ impl App {
                     };
 
                     let is_dotdot = entry_name == "..";
-                    let icon = if is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
+                    let icon = if is_dir { "[D]" } else { " - " };
 
                     let mut menu_items: Vec<Element<'_, Message>> = vec![
                         text(format!("{} {}", icon, entry_name)).size(13).into(),
@@ -2764,7 +2791,7 @@ impl App {
                     if !is_dotdot {
                         if is_local {
                             menu_items.push(
-                                button(text("Upload \u{25B6}").size(12))
+                                button(text("Upload >>").size(12))
                                     .on_press(Message::ShowContextMenu(ContextAction::Upload))
                                     .padding([4, 12])
                                     .width(Length::Fill)
@@ -2772,7 +2799,7 @@ impl App {
                             );
                         } else {
                             menu_items.push(
-                                button(text("\u{25C0} Download").size(12))
+                                button(text("<< Download").size(12))
                                     .on_press(Message::ShowContextMenu(ContextAction::Download))
                                     .padding([4, 12])
                                     .width(Length::Fill)

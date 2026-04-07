@@ -161,8 +161,8 @@ pub fn view_panel<'a>(
 ) -> Element<'a, PanelMessage> {
     // Clickable breadcrumbs
     let mut breadcrumbs = row![
-        button(text("\u{25C0}").size(12)).on_press(PanelMessage::GoUp).padding([2, 6]),
-        button(text("\u{2302}").size(12)).on_press(PanelMessage::GoHome).padding([2, 6]),
+        button(text("<").size(12)).on_press(PanelMessage::GoUp).padding([2, 6]),
+        button(text("~").size(12)).on_press(PanelMessage::GoHome).padding([2, 6]),
     ]
     .spacing(1)
     .align_y(Alignment::Center);
@@ -184,7 +184,7 @@ pub fn view_panel<'a>(
     }
     breadcrumbs = breadcrumbs.push(horizontal_space());
     breadcrumbs = breadcrumbs.push(
-        button(text("\u{21BB}").size(12)).on_press(PanelMessage::Refresh).padding([2, 6]),
+        button(text("R").size(12)).on_press(PanelMessage::Refresh).padding([2, 6]),
     );
 
     let header = breadcrumbs;
@@ -197,7 +197,7 @@ pub fn view_panel<'a>(
 
     let sort_arrow = |col: SortColumn| -> &str {
         if sort_column == col {
-            if sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+            if sort_ascending { " ^" } else { " v" }
         } else {
             ""
         }
@@ -232,7 +232,7 @@ pub fn view_panel<'a>(
         })
         .enumerate()
         .map(|(visual_idx, (i, entry))| {
-            let icon = if entry.is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
+            let icon = if entry.is_dir { "[D]" } else { " - " };
             let r = button(
                 row![
                     text(format!("{} {}", icon, entry.name))
