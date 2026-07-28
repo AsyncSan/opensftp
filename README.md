@@ -16,10 +16,11 @@ Pre-built binaries. No installation required.
 
 | Platform | Download | Notes |
 |----------|----------|-------|
-| macOS | [OpenSFTP-0.1.0-macOS.zip](https://github.com/AsyncSan/opensftp/releases/latest) | Universal (Intel + Apple Silicon). Not code-signed yet — on first launch, right-click the app and choose **Open**. |
-| Linux (ARM64) | [OpenSFTP-0.1.0-linux-aarch64.tar.gz](https://github.com/AsyncSan/opensftp/releases/latest) | Extract and run: `tar xzf OpenSFTP-*.tar.gz && ./opensftp` |
-| Linux (x86_64) | — | Not built yet. [Build from source](#build-from-source). |
-| Windows | — | Not built yet. [Build from source](#build-from-source). |
+| Windows | [opensftp-windows-x86_64.exe](https://github.com/AsyncSan/opensftp/releases/latest) | Standalone `.exe`. Not signed, so SmartScreen may warn on first run. |
+| Linux (x86_64) | [opensftp-linux-x86_64](https://github.com/AsyncSan/opensftp/releases/latest) | `chmod +x opensftp-linux-x86_64 && ./opensftp-linux-x86_64` |
+| macOS (Apple Silicon) | [opensftp-macos-aarch64](https://github.com/AsyncSan/opensftp/releases/latest) | `chmod +x opensftp-macos-aarch64 && ./opensftp-macos-aarch64` |
+| macOS (`.app` bundle) | [OpenSFTP-0.1.0-macOS.zip](https://github.com/AsyncSan/opensftp/releases/tag/v0.1.0) | Universal (Intel + Apple Silicon), still at 0.1.0. Not code-signed — right-click the app and choose **Open** on first launch. |
+| Linux (ARM64) | [OpenSFTP-0.1.0-linux-aarch64.tar.gz](https://github.com/AsyncSan/opensftp/releases/tag/v0.1.0) | Still at 0.1.0. `tar xzf OpenSFTP-*.tar.gz && ./opensftp` |
 
 On first launch, the app asks whether you want to run it **portable** (just the binary) or **install it** to your system (adds to Applications/Start Menu/Dock). You can change this anytime in Settings.
 
@@ -53,7 +54,7 @@ All releases: [github.com/AsyncSan/opensftp/releases](https://github.com/AsyncSa
 
 **Transfers:** upload and download files and entire directories recursively. Live progress bar with byte counters. Transfer log with success/failure status.
 
-**Authentication:** password, SSH key file, or SSH agent. Reads known hosts from `~/.ssh/known_hosts` with host key verification.
+**Authentication:** password, SSH key file, or SSH agent. Reads known hosts from `~/.ssh/known_hosts` with host key verification. On Windows the agent is read from the OpenSSH named pipe; Pageant is not supported.
 
 **Connection profiles:** save, load, and manage server connections. Favorites shown as bookmarks bar for quick connect. Profiles are stored as plain JSON in your config directory — **saved passwords are not encrypted**. Prefer SSH keys or the SSH agent. See [SECURITY.md](SECURITY.md).
 
