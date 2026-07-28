@@ -11,6 +11,9 @@ env:
 jobs:
   build:
     strategy:
+      # One platform failing must not cancel the others — that is how the
+      # macOS x86_64 build was lost in the v0.1.0 run.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04

@@ -202,7 +202,7 @@ impl SftpConnection {
                 is_dir: meta.file_type().is_dir(),
                 size: meta.size.unwrap_or(0),
                 mtime: meta.mtime.unwrap_or(0) as u64,
-                permissions: meta.permissions.map(|p| p as u32).unwrap_or(0),
+                permissions: meta.permissions.unwrap_or(0),
             });
         }
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));

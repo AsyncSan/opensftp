@@ -211,20 +211,20 @@ impl std::fmt::Debug for Message {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Screen {
+pub enum Screen {
     Connect,
     Connecting,
     Browser,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ActivePanel {
+pub enum ActivePanel {
     Local,
     Remote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Dialog {
+pub enum Dialog {
     None,
     Mkdir(String),
     ConfirmDelete(String),
@@ -240,7 +240,7 @@ enum Dialog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ContextMenu {
+pub enum ContextMenu {
     None,
     Local(usize),
     Remote(usize),
@@ -260,14 +260,14 @@ pub(crate) enum ContextAction {
 }
 
 #[derive(Debug, Clone)]
-struct TransferLogEntry {
+pub struct TransferLogEntry {
     message: String,
     is_error: bool,
     timestamp: String,
 }
 
 #[derive(Debug, Clone)]
-struct TerminalEntry {
+pub struct TerminalEntry {
     command: String,
     output: String,
     is_error: bool,
@@ -358,11 +358,7 @@ impl Session {
             (Screen::Connect, String::new(), Vec::new(), "Not connected".to_string())
         };
 
-        let initial_dialog = if cfg!(test) {
-            Dialog::None
-        } else {
-            Dialog::None
-        };
+        let initial_dialog = Dialog::None;
 
         Self {
             id,
@@ -1158,9 +1154,9 @@ impl App {
                 }
             }
             Message::MkdirConfirm => {
-                if let Dialog::Mkdir(ref name) = self.sessions[self.active_tab].dialog {
-                    if !name.is_empty() {
-                        if let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
+                if let Dialog::Mkdir(ref name) = self.sessions[self.active_tab].dialog
+                    && !name.is_empty()
+                        && let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
                             let path = format!("{}/{}", self.sessions[self.active_tab].remote_path, name);
                             let refresh_path = self.sessions[self.active_tab].remote_path.clone();
                             self.sessions[self.active_tab].dialog = Dialog::None;
@@ -1176,8 +1172,6 @@ impl App {
                                 },
                             );
                         }
-                    }
-                }
             }
             Message::MkdirCancel => {
                 self.sessions[self.active_tab].dialog = Dialog::None;
@@ -1200,8 +1194,8 @@ impl App {
                 }
             }
             Message::DeleteConfirm => {
-                if let Dialog::ConfirmDelete(_) = self.sessions[self.active_tab].dialog {
-                    if let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
+                if let Dialog::ConfirmDelete(_) = self.sessions[self.active_tab].dialog
+                    && let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
                         let items: Vec<(String, bool)> = self.sessions[self.active_tab].remote_selected.iter()
                             .filter_map(|&idx| self.sessions[self.active_tab].remote_entries.get(idx))
                             .filter(|e| e.name != "..")
@@ -1228,21 +1222,17 @@ impl App {
                             },
                         );
                     }
-                }
             }
             Message::DeleteCancel => {
                 self.sessions[self.active_tab].dialog = Dialog::None;
             }
             Message::RemoteRename => {
-                if self.sessions[self.active_tab].screen == Screen::Browser {
-                    if let Some(&idx) = self.sessions[self.active_tab].remote_selected.iter().next() {
-                        if let Some(entry) = self.sessions[self.active_tab].remote_entries.get(idx) {
-                            if entry.name != ".." {
+                if self.sessions[self.active_tab].screen == Screen::Browser
+                    && let Some(&idx) = self.sessions[self.active_tab].remote_selected.iter().next()
+                        && let Some(entry) = self.sessions[self.active_tab].remote_entries.get(idx)
+                            && entry.name != ".." {
                                 self.sessions[self.active_tab].dialog = Dialog::Rename(entry.name.clone(), entry.name.clone());
                             }
-                        }
-                    }
-                }
             }
             Message::RenameNameChanged(name) => {
                 if let Dialog::Rename(_, ref mut new) = self.sessions[self.active_tab].dialog {
@@ -1250,9 +1240,9 @@ impl App {
                 }
             }
             Message::RenameConfirm => {
-                if let Dialog::Rename(ref old, ref new) = self.sessions[self.active_tab].dialog {
-                    if !new.is_empty() && old != new {
-                        if let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
+                if let Dialog::Rename(ref old, ref new) = self.sessions[self.active_tab].dialog
+                    && !new.is_empty() && old != new
+                        && let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
                             let from = format!("{}/{}", self.sessions[self.active_tab].remote_path, old);
                             let to = format!("{}/{}", self.sessions[self.active_tab].remote_path, new);
                             let refresh_path = self.sessions[self.active_tab].remote_path.clone();
@@ -1269,8 +1259,6 @@ impl App {
                                 },
                             );
                         }
-                    }
-                }
             }
             Message::RenameCancel => {
                 self.sessions[self.active_tab].dialog = Dialog::None;
@@ -1364,15 +1352,12 @@ impl App {
                 self.sessions[self.active_tab].dialog = Dialog::None;
             }
             Message::LocalRename => {
-                if self.sessions[self.active_tab].screen == Screen::Browser {
-                    if let Some(&idx) = self.sessions[self.active_tab].local_selected.iter().next() {
-                        if let Some(entry) = self.sessions[self.active_tab].local_entries.get(idx) {
-                            if entry.name != ".." {
+                if self.sessions[self.active_tab].screen == Screen::Browser
+                    && let Some(&idx) = self.sessions[self.active_tab].local_selected.iter().next()
+                        && let Some(entry) = self.sessions[self.active_tab].local_entries.get(idx)
+                            && entry.name != ".." {
                                 self.sessions[self.active_tab].dialog = Dialog::LocalRename(entry.name.clone(), entry.name.clone());
                             }
-                        }
-                    }
-                }
             }
             Message::LocalRenameNameChanged(name) => {
                 if let Dialog::LocalRename(_, ref mut new) = self.sessions[self.active_tab].dialog {
@@ -1447,9 +1432,9 @@ impl App {
             }
 
             Message::RemoteChmod => {
-                if let Some(&idx) = self.sessions[self.active_tab].remote_selected.iter().next() {
-                    if let Some(entry) = self.sessions[self.active_tab].remote_entries.get(idx) {
-                        if entry.name != ".." {
+                if let Some(&idx) = self.sessions[self.active_tab].remote_selected.iter().next()
+                    && let Some(entry) = self.sessions[self.active_tab].remote_entries.get(idx)
+                        && entry.name != ".." {
                             let path = format!("{}/{}", self.sessions[self.active_tab].remote_path, entry.name);
                             // Parse current permissions to octal
                             let octal = if !entry.permissions.is_empty() {
@@ -1457,7 +1442,7 @@ impl App {
                                 let chars: Vec<char> = entry.permissions.chars().collect();
                                 let flags = [0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001];
                                 for (i, &flag) in flags.iter().enumerate() {
-                                    if chars.get(i).map_or(false, |&c| c != '-') {
+                                    if chars.get(i).is_some_and(|&c| c != '-') {
                                         mode |= flag;
                                     }
                                 }
@@ -1467,8 +1452,6 @@ impl App {
                             };
                             self.sessions[self.active_tab].dialog = Dialog::Chmod(path, octal);
                         }
-                    }
-                }
             }
 
             Message::ChmodValueChanged(val) => {
@@ -1483,9 +1466,9 @@ impl App {
                     _ => { return Task::none(); }
                 };
                 self.sessions[self.active_tab].dialog = Dialog::None;
-                if let Ok(mode) = u32::from_str_radix(&octal, 8) {
-                    if mode <= 0o7777 {
-                        if let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
+                if let Ok(mode) = u32::from_str_radix(&octal, 8)
+                    && mode <= 0o7777
+                        && let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
                             let remote_path = self.sessions[self.active_tab].remote_path.clone();
                             return Task::perform(
                                 async move {
@@ -1499,8 +1482,6 @@ impl App {
                                 },
                             );
                         }
-                    }
-                }
                 self.sessions[self.active_tab].status = format!("Invalid octal: {}", octal);
             }
 
@@ -1610,8 +1591,8 @@ impl App {
                     ContextAction::Open => {
                         match ctx {
                             ContextMenu::Local(i) => {
-                                if let Some(entry) = self.sessions[self.active_tab].local_entries.get(i) {
-                                    if entry.is_dir {
+                                if let Some(entry) = self.sessions[self.active_tab].local_entries.get(i)
+                                    && entry.is_dir {
                                         let new_path = if entry.name == ".." {
                                             std::path::Path::new(&self.sessions[self.active_tab].local_path)
                                                 .parent()
@@ -1625,11 +1606,10 @@ impl App {
                                         self.sessions[self.active_tab].local_selected.clear();
                                         self.sessions[self.active_tab].last_anchor_local = None;
                                     }
-                                }
                             }
                             ContextMenu::Remote(i) => {
-                                if let Some(entry) = self.sessions[self.active_tab].remote_entries.get(i) {
-                                    if entry.is_dir {
+                                if let Some(entry) = self.sessions[self.active_tab].remote_entries.get(i)
+                                    && entry.is_dir {
                                         let new_path = if entry.name == ".." {
                                             parent_path(&self.sessions[self.active_tab].remote_path)
                                         } else {
@@ -1651,7 +1631,6 @@ impl App {
                                             );
                                         }
                                     }
-                                }
                             }
                             ContextMenu::None => {}
                         }
@@ -2100,8 +2079,8 @@ impl App {
                     Key::Named(keyboard::key::Named::Enter) => {
                         match self.sessions[self.active_tab].active_panel {
                             ActivePanel::Local => {
-                                if let Some(&idx) = self.sessions[self.active_tab].local_selected.iter().next() {
-                                    if let Some(entry) = self.sessions[self.active_tab].local_entries.get(idx) {
+                                if let Some(&idx) = self.sessions[self.active_tab].local_selected.iter().next()
+                                    && let Some(entry) = self.sessions[self.active_tab].local_entries.get(idx) {
                                         if entry.is_dir {
                                             let new_path = if entry.name == ".." {
                                                 std::path::Path::new(&self.sessions[self.active_tab].local_path)
@@ -2119,11 +2098,10 @@ impl App {
                                             return self.update(Message::UploadSelected);
                                         }
                                     }
-                                }
                             }
                             ActivePanel::Remote => {
-                                if let Some(&idx) = self.sessions[self.active_tab].remote_selected.iter().next() {
-                                    if let Some(entry) = self.sessions[self.active_tab].remote_entries.get(idx) {
+                                if let Some(&idx) = self.sessions[self.active_tab].remote_selected.iter().next()
+                                    && let Some(entry) = self.sessions[self.active_tab].remote_entries.get(idx) {
                                         if entry.is_dir {
                                             let new_path = if entry.name == ".." {
                                                 parent_path(&self.sessions[self.active_tab].remote_path)
@@ -2149,7 +2127,6 @@ impl App {
                                             return self.update(Message::DownloadSelected);
                                         }
                                     }
-                                }
                             }
                         }
                     }
@@ -2222,11 +2199,10 @@ impl App {
                     }
                     // Ctrl+1-9: Switch to tab N
                     Key::Character(ref c) if mods.control() => {
-                        if let Ok(n) = c.parse::<usize>() {
-                            if n >= 1 && n <= self.sessions.len() {
+                        if let Ok(n) = c.parse::<usize>()
+                            && n >= 1 && n <= self.sessions.len() {
                                 return self.update(Message::SwitchTab(n - 1));
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -2405,11 +2381,11 @@ impl App {
                 // Transfer buttons between panels
                 let can_upload = !self.sessions[self.active_tab].local_selected.is_empty()
                     && self.sessions[self.active_tab].local_selected.iter()
-                        .any(|&idx| self.sessions[self.active_tab].local_entries.get(idx).map_or(false, |e| e.name != ".."))
+                        .any(|&idx| self.sessions[self.active_tab].local_entries.get(idx).is_some_and(|e| e.name != ".."))
                     && !self.sessions[self.active_tab].transfer_active;
                 let can_download = !self.sessions[self.active_tab].remote_selected.is_empty()
                     && self.sessions[self.active_tab].remote_selected.iter()
-                        .any(|&idx| self.sessions[self.active_tab].remote_entries.get(idx).map_or(false, |e| e.name != ".."))
+                        .any(|&idx| self.sessions[self.active_tab].remote_entries.get(idx).is_some_and(|e| e.name != ".."))
                     && !self.sessions[self.active_tab].transfer_active;
 
                 let mut upload_btn = button(row![icons::upload(12.0), text(" Upload").size(12)].align_y(iced::Alignment::Center)).padding([6, 14]);
@@ -3049,7 +3025,7 @@ impl App {
                     }
                     Dialog::Chmod(path, octal) => {
                         let preview = u32::from_str_radix(octal, 8)
-                            .map(|m| format_permissions(m))
+                            .map(format_permissions)
                             .unwrap_or_else(|_| "invalid".to_string());
                         let filename = path.rsplit('/').next().unwrap_or(path);
                         iced::widget::stack![

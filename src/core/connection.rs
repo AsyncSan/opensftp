@@ -136,8 +136,8 @@ impl ConnectionProfile {
 
         if profiles.is_empty() {
             let py_path = Self::python_profiles_path();
-            if let Ok(content) = std::fs::read_to_string(&py_path) {
-                if let Ok(py_profiles) = serde_json::from_str::<Vec<PythonProfile>>(&content) {
+            if let Ok(content) = std::fs::read_to_string(&py_path)
+                && let Ok(py_profiles) = serde_json::from_str::<Vec<PythonProfile>>(&content) {
                     profiles = py_profiles
                         .into_iter()
                         .filter(|p| !p.host.is_empty())
@@ -145,7 +145,6 @@ impl ConnectionProfile {
                         .collect();
                     let _ = Self::save_all(&profiles);
                 }
-            }
         }
 
         profiles
@@ -157,7 +156,7 @@ impl ConnectionProfile {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(profiles)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(&path, json)
     }
 }

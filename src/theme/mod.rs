@@ -13,20 +13,13 @@ pub enum InstallMode {
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Settings {
     pub theme: AppTheme,
     #[serde(default)]
     pub install_mode: Option<InstallMode>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            theme: AppTheme::default(),
-            install_mode: None,
-        }
-    }
-}
 
 impl Settings {
     pub fn settings_path() -> PathBuf {
@@ -66,7 +59,9 @@ impl Settings {
 // ── Theme ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum AppTheme {
+    #[default]
     Dark,
     Light,
     Nord,
@@ -91,11 +86,6 @@ pub enum AppTheme {
     Ferra,
 }
 
-impl Default for AppTheme {
-    fn default() -> Self {
-        Self::Dark
-    }
-}
 
 impl AppTheme {
     pub fn to_iced_theme(self) -> Theme {

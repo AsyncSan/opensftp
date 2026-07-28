@@ -148,7 +148,7 @@ fn host_matches(hosts_field: &str, target: &str) -> bool {
         let pattern = pattern.trim();
         if pattern.starts_with('!') {
             // Negation: if it matches, this entry does NOT apply
-            if pattern_matches(&pattern[1..], target) {
+            if pattern_matches(pattern.strip_prefix('!').unwrap_or(pattern), target) {
                 return false;
             }
         } else if pattern_matches(pattern, target) {
