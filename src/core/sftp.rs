@@ -159,7 +159,9 @@ impl SftpConnection {
                 )
                 .await
                 {
-                    Ok(a) => a,
+                    // .dynamic() boxes the stream so both arms share one type:
+                    // the named pipe and Pageant clients are otherwise distinct.
+                    Ok(a) => a.dynamic(),
                     Err(pipe_err) => russh::keys::agent::client::AgentClient::connect_pageant()
                         .await
                         .map_err(|pageant_err| {
@@ -167,7 +169,8 @@ impl SftpConnection {
                                 "Failed to connect to SSH agent (OpenSSH: {}; Pageant: {})",
                                 pipe_err, pageant_err
                             )
-                        })?,
+                        })?
+                        .dynamic(),
                 };
                 let identities = agent
                     .request_identities()
