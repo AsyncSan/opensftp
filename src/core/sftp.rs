@@ -148,30 +148,20 @@ impl SftpConnection {
             }
             AuthMethod::Agent => {
                 // The agent transport differs per platform: a Unix socket from
-                // $SSH_AUTH_SOCK, or a named pipe on Windows (OpenSSH, else Pageant).
+                // $SSH_AUTH_SOCK, or the OpenSSH named pipe on Windows.
+                // Pageant is deliberately not supported: connect_pageant returns a
+                // different concrete client type, and unifying the two via
+                // .dynamic() made the Windows build fail to infer lifetimes.
                 #[cfg(unix)]
                 let mut agent = russh::keys::agent::client::AgentClient::connect_env()
                     .await
                     .map_err(|e| format!("Failed to connect to SSH agent: {}", e))?;
                 #[cfg(windows)]
-                let mut agent = match russh::keys::agent::client::AgentClient::connect_named_pipe(
+                let mut agent = russh::keys::agent::client::AgentClient::connect_named_pipe(
                     r"\\.\pipe\openssh-ssh-agent",
                 )
                 .await
-                {
-                    // .dynamic() boxes the stream so both arms share one type:
-                    // the named pipe and Pageant clients are otherwise distinct.
-                    Ok(a) => a.dynamic(),
-                    Err(pipe_err) => russh::keys::agent::client::AgentClient::connect_pageant()
-                        .await
-                        .map_err(|pageant_err| {
-                            format!(
-                                "Failed to connect to SSH agent (OpenSSH: {}; Pageant: {})",
-                                pipe_err, pageant_err
-                            )
-                        })?
-                        .dynamic(),
-                };
+                .map_err(|e| format!("Failed to connect to SSH agent: {}", e))?;
                 let identities = agent
                     .request_identities()
                     .await
