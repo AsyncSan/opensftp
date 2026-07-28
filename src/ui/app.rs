@@ -518,20 +518,7 @@ impl App {
 
                     let jump_host: Option<JumpHostConfig> = self.sessions[self.active_tab].connect_state.jump_host_config();
                     return Task::perform(
-                        async move {
-                            let conn = if let Some(jump) = jump_host {
-                                SftpConnection::connect_with_jump_host(&host, port, &username, &auth, &jump).await?
-                            } else {
-                                SftpConnection::connect(&host, port, &username, &auth).await?
-                            };
-                            let conn = Arc::new(conn);
-
-                            let home = conn.sftp.canonicalize(".").await
-                                .unwrap_or_else(|_| "/".to_string());
-
-                            let entries = conn.list_dir(&home).await?;
-                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((conn, entries, home))
-                        },
+                        connect_and_list(host, port, username, auth, jump_host),
                         |result| match result {
                             Ok((conn, entries, home)) => Message::Connected(conn, entries, home),
                             Err(e) => Message::ConnectionFailed(e.to_string()),
@@ -3280,6 +3267,40 @@ impl App {
 
         Subscription::batch([keys, drops])
     }
+}
+
+/// Connect, resolve the remote home directory, and list it.
+///
+/// Deliberately a named `async fn` taking only owned arguments rather than an
+/// inline `async move` block: as an inline block the Windows build failed with
+/// a higher-ranked lifetime error at the `Task::perform` call site.
+type ConnectResult = Result<
+    (Arc<SftpConnection>, Vec<RemoteEntry>, String),
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
+async fn connect_and_list(
+    host: String,
+    port: u16,
+    username: String,
+    auth: crate::core::connection::AuthMethod,
+    jump_host: Option<JumpHostConfig>,
+) -> ConnectResult {
+    let conn = if let Some(jump) = jump_host {
+        SftpConnection::connect_with_jump_host(&host, port, &username, &auth, &jump).await?
+    } else {
+        SftpConnection::connect(&host, port, &username, &auth).await?
+    };
+    let conn = Arc::new(conn);
+
+    let home = conn
+        .sftp
+        .canonicalize(".")
+        .await
+        .unwrap_or_else(|_| "/".to_string());
+
+    let entries = conn.list_dir(&home).await?;
+    Ok((conn, entries, home))
 }
 
 /// Spawn a transfer task and return a streaming Task for live progress.
