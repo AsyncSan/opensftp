@@ -30,6 +30,6 @@ Built in Rust with Iced. No Electron, no Python runtime. The stripped binary is 
 It replaces my previous Python/Electron client that was using 400-500MB RAM. This one sits around 20-40MB while actively transferring.
 
 **Download:** https://renemurrell.de/software/opensftp  
-**GitHub:** https://github.com/mylilcrowdi/Open-SFTP-Rust  
+**GitHub:** https://github.com/AsyncSan/opensftp  
 
 MIT licensed, free, no telemetry. Feedback welcome.

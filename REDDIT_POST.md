@@ -35,4 +35,4 @@ I used agentic AI (Claude Code) for most of the implementation. Not copilot-styl
 Treat the agent like a very fast junior engineer. They need clear tickets. They do not replace the architect. You still need to understand the codebase well enough to review the output.
 
 App: https://renemurrell.de/software/opensftp  
-GitHub: https://github.com/mylilcrowdi/Open-SFTP-Rust
+GitHub: https://github.com/AsyncSan/opensftp

@@ -56,6 +56,6 @@ Agentic AI is not autocomplete on steroids. You become architect + PM. The agent
 For solo developers building real tools, this is genuinely powerful. I shipped something I would have taken months on in a fraction of the time.
 
 Download: https://renemurrell.de/software/opensftp
-Repo: https://github.com/mylilcrowdi/Open-SFTP-Rust
+Repo: https://github.com/AsyncSan/opensftp
 
 What has your experience been with agentic AI on systems-level projects?

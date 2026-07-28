@@ -14,7 +14,7 @@ Show HN: Open SFTP - native Rust SFTP client, no Electron, ~8MB, 22 themes
 
 ## URL
 
-https://github.com/mylilcrowdi/Open-SFTP-Rust
+https://github.com/AsyncSan/opensftp
 
 ---
 

@@ -12,17 +12,18 @@ Built with [Iced](https://iced.rs) for the GUI and [russh](https://github.com/wa
 
 ## Download
 
-Pre-built binaries for macOS, Windows and Linux. No installation required.
+Pre-built binaries. No installation required.
 
 | Platform | Download | Notes |
 |----------|----------|-------|
-| macOS | [OpenSFTP-0.1.0-macOS.zip](https://github.com/mylilcrowdi/Open-SFTP-Rust/releases/latest) | Universal (Intel + Apple Silicon). Unzip and double-click. |
-| Windows | [OpenSFTP-0.1.0-Windows.exe](https://github.com/mylilcrowdi/Open-SFTP-Rust/releases/latest) | Standalone .exe. Double-click to run. |
-| Linux | [OpenSFTP-0.1.0-linux-x86_64.tar.gz](https://github.com/mylilcrowdi/Open-SFTP-Rust/releases/latest) | Extract and run: `tar xzf OpenSFTP-*.tar.gz && ./opensftp` |
+| macOS | [OpenSFTP-0.1.0-macOS.zip](https://github.com/AsyncSan/opensftp/releases/latest) | Universal (Intel + Apple Silicon). Not code-signed yet — on first launch, right-click the app and choose **Open**. |
+| Linux (ARM64) | [OpenSFTP-0.1.0-linux-aarch64.tar.gz](https://github.com/AsyncSan/opensftp/releases/latest) | Extract and run: `tar xzf OpenSFTP-*.tar.gz && ./opensftp` |
+| Linux (x86_64) | — | Not built yet. [Build from source](#build-from-source). |
+| Windows | — | Not built yet. [Build from source](#build-from-source). |
 
 On first launch, the app asks whether you want to run it **portable** (just the binary) or **install it** to your system (adds to Applications/Start Menu/Dock). You can change this anytime in Settings.
 
-All releases: [github.com/mylilcrowdi/Open-SFTP-Rust/releases](https://github.com/mylilcrowdi/Open-SFTP-Rust/releases)
+All releases: [github.com/AsyncSan/opensftp/releases](https://github.com/AsyncSan/opensftp/releases)
 
 ---
 
@@ -54,11 +55,17 @@ All releases: [github.com/mylilcrowdi/Open-SFTP-Rust/releases](https://github.co
 
 **Authentication:** password, SSH key file, or SSH agent. Reads known hosts from `~/.ssh/known_hosts` with host key verification.
 
-**Connection profiles:** save, load, and manage server connections. Favorites shown as bookmarks bar for quick connect.
+**Connection profiles:** save, load, and manage server connections. Favorites shown as bookmarks bar for quick connect. Profiles are stored as plain JSON in your config directory — **saved passwords are not encrypted**. Prefer SSH keys or the SSH agent. See [SECURITY.md](SECURITY.md).
 
 **Remote operations:** create directories, rename files, delete files and folders, change permissions (chmod). Right-click context menu for quick access.
 
 **Embedded SSH terminal:** run commands on the remote server without leaving the app.
+
+**Jump host:** connect through a bastion/jump host via SSH channel forwarding.
+
+**Multi-tab sessions:** open several server connections in tabs; open paths are restored on restart.
+
+**Drag and drop:** drop files onto the window to upload, or pick them with the file dialog.
 
 **22 built-in themes:** Dark, Light, Nord, Dracula, Solarized, Gruvbox, Catppuccin (Latte/Frappe/Macchiato/Mocha), Tokyo Night, Kanagawa, Moonfly, Nightfly, Oxocarbon, Ferra. Switch with Ctrl+T, persisted across sessions.
 
@@ -68,6 +75,10 @@ All releases: [github.com/mylilcrowdi/Open-SFTP-Rust/releases](https://github.co
 
 **Small binary:** release build with LTO and strip produces a single static executable under 10 MB. No runtime dependencies.
 
+### Not supported (yet)
+
+To be clear about what this does *not* do today: no FTP or FTPS (SFTP only), no parallel/multi-threaded transfers or bandwidth limiting (transfers run one at a time), no OS keychain integration, no cloud storage backends (S3, GCS), no file search or filtering, and no automatic update checks.
+
 ---
 
 ## Build from Source
@@ -75,8 +86,8 @@ All releases: [github.com/mylilcrowdi/Open-SFTP-Rust/releases](https://github.co
 Requires Rust 1.85+ and a working C linker.
 
 ```bash
-git clone https://github.com/mylilcrowdi/Open-SFTP-Rust.git
-cd Open-SFTP-Rust
+git clone https://github.com/AsyncSan/opensftp.git
+cd opensftp
 cargo run
 ```
 
@@ -101,7 +112,9 @@ Output goes to `dist/`.
 cargo test
 ```
 
-263 tests covering core modules: connection profiles, known hosts, SFTP operations, transfer engine, theme persistence, settings, desktop integration, and UI.
+280 tests covering core modules: connection profiles, known hosts, SFTP operations, transfer engine, theme persistence, settings, desktop integration, and UI.
+
+> **Known issue:** some tests read and write the real user config directory instead of an isolated fixture path. Running `cargo test` will overwrite your saved connection profiles and theme setting, and two theme tests fail on a machine that has a non-default theme saved. Track: [#1](https://github.com/AsyncSan/opensftp/issues).
 
 ---
 
@@ -129,4 +142,4 @@ src/
 
 ## License
 
-MIT. See [Cargo.toml](Cargo.toml) for details.
+MIT. See [LICENSE](LICENSE).

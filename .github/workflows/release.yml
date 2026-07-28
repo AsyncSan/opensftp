@@ -59,7 +59,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          cp target/${{ matrix.target }}/release/eurosftp ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/opensftp ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
 
       - name: Rename artifact (windows)
@@ -67,7 +67,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          cp target/${{ matrix.target }}/release/eurosftp.exe ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/opensftp.exe ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
         with:

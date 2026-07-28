@@ -39,7 +39,7 @@ A few things that surprised me:
 Not a magic story. More like: AI is a very fast junior who needs clear tickets. For Rust specifically, the tighter the scope, the better.
 
 **Links:**
-- GitHub: https://github.com/mylilcrowdi/Open-SFTP-Rust
+- GitHub: https://github.com/AsyncSan/opensftp
 - Download (macOS/Win/Linux): https://renemurrell.de/software/opensftp
 - MIT licensed
 

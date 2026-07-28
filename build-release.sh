@@ -20,7 +20,7 @@ case "$OS" in
         STAGING="dist/staging-linux"
         rm -rf "$STAGING"
         mkdir -p "$STAGING"
-        cp target/release/eurosftp "$STAGING/opensftp"
+        cp target/release/opensftp "$STAGING/opensftp"
         chmod +x "$STAGING/opensftp"
 
         TARBALL="dist/OpenSFTP-${VERSION}-linux-${ARCH}.tar.gz"
@@ -41,8 +41,8 @@ case "$OS" in
 
         echo "--- Creating Universal Binary ---"
         lipo -create \
-            target/aarch64-apple-darwin/release/eurosftp \
-            target/x86_64-apple-darwin/release/eurosftp \
+            target/aarch64-apple-darwin/release/opensftp \
+            target/x86_64-apple-darwin/release/opensftp \
             -output dist/opensftp-universal
         chmod +x dist/opensftp-universal
 
@@ -97,8 +97,8 @@ PLIST
         echo "  Unzip and drag to Applications, or double-click to run."
 
         # Also create standalone binaries for direct download
-        cp target/aarch64-apple-darwin/release/eurosftp "dist/opensftp-${VERSION}-macos-aarch64"
-        cp target/x86_64-apple-darwin/release/eurosftp "dist/opensftp-${VERSION}-macos-x86_64"
+        cp target/aarch64-apple-darwin/release/opensftp "dist/opensftp-${VERSION}-macos-aarch64"
+        cp target/x86_64-apple-darwin/release/opensftp "dist/opensftp-${VERSION}-macos-x86_64"
         cp dist/opensftp-universal "dist/opensftp-${VERSION}-macos-universal"
         chmod +x dist/opensftp-${VERSION}-macos-*
 
@@ -109,7 +109,7 @@ PLIST
     *)
         echo "--- Building Windows x86_64 ---"
         cargo build --release
-        cp target/release/eurosftp.exe "dist/OpenSFTP-${VERSION}-Windows.exe"
+        cp target/release/opensftp.exe "dist/OpenSFTP-${VERSION}-Windows.exe"
         echo "Built: dist/OpenSFTP-${VERSION}-Windows.exe"
         echo "  Double-click to run."
         ;;

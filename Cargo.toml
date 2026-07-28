@@ -1,5 +1,5 @@
 [package]
-name = "eurosftp"
+name = "opensftp"
 version = "0.1.0"
 edition = "2024"
 description = "A modern, fast SFTP client"

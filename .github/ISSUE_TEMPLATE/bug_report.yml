@@ -1,0 +1,48 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: openSFTP version
+      placeholder: "0.1.0, or the commit hash if built from source"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (ARM64)
+        - Windows
+    validations:
+      required: true
+  - type: textarea
+    id: server
+    attributes:
+      label: Server details (if relevant)
+      description: SSH server software and version, auth method used (password / key / agent / jump host).
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: Any error message shown in the app or on the console.
+      render: shell
+  - type: checkboxes
+    id: no-secrets
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have removed hostnames, usernames, keys and passwords from anything I pasted above.
+          required: true

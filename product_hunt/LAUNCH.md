@@ -100,7 +100,7 @@ cd ~/eurosftp && cargo build --release
 - [ ] Website URL: https://renemurrell.de/software/opensftp
 - [ ] Topics: Developer Tools, Open Source, Productivity
 - [ ] Maker comment posted immediately after launch (update [DEV.TO_URL] first)
-- [ ] GitHub repo linked: https://github.com/mylilcrowdi/Open-SFTP-Rust
+- [ ] GitHub repo linked: https://github.com/AsyncSan/opensftp
 - [ ] Post at exactly 12:01am PST on Tuesday or Wednesday
 
 ---

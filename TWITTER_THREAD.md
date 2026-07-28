@@ -79,7 +79,7 @@ Your job: clear task specs + sharp review.
 Open SFTP is MIT, free download.
 
 https://renemurrell.de/software/opensftp
-https://github.com/mylilcrowdi/Open-SFTP-Rust
+https://github.com/AsyncSan/opensftp
 
 Building with agentic AI? What has worked for you?
 

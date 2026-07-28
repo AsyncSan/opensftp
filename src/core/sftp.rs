@@ -147,9 +147,28 @@ impl SftpConnection {
                     .await?
             }
             AuthMethod::Agent => {
+                // The agent transport differs per platform: a Unix socket from
+                // $SSH_AUTH_SOCK, or a named pipe on Windows (OpenSSH, else Pageant).
+                #[cfg(unix)]
                 let mut agent = russh::keys::agent::client::AgentClient::connect_env()
                     .await
                     .map_err(|e| format!("Failed to connect to SSH agent: {}", e))?;
+                #[cfg(windows)]
+                let mut agent = match russh::keys::agent::client::AgentClient::connect_named_pipe(
+                    r"\\.\pipe\openssh-ssh-agent",
+                )
+                .await
+                {
+                    Ok(a) => a,
+                    Err(pipe_err) => russh::keys::agent::client::AgentClient::connect_pageant()
+                        .await
+                        .map_err(|pageant_err| {
+                            format!(
+                                "Failed to connect to SSH agent (OpenSSH: {}; Pageant: {})",
+                                pipe_err, pageant_err
+                            )
+                        })?,
+                };
                 let identities = agent
                     .request_identities()
                     .await

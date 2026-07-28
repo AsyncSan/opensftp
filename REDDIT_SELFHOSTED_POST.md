@@ -32,7 +32,7 @@ Pre-built binaries for macOS (Universal), Windows, Linux (aarch64 + x86_64)
 https://renemurrell.de/software/opensftp
 
 MIT licensed. ~8MB binary. No dependencies.
-GitHub: https://github.com/mylilcrowdi/Open-SFTP-Rust
+GitHub: https://github.com/AsyncSan/opensftp
 
 v0.1.0 - early but stable for daily use. Feedback welcome.
 
