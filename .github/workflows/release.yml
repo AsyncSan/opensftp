@@ -103,8 +103,10 @@ jobs:
             |----------|------|-------|
             | Linux | `opensftp-linux-x86_64` | Standalone binary, `chmod +x` and run |
             | macOS (Apple Silicon) | `opensftp-macos-aarch64` | M1/M2/M3/M4, `chmod +x` and run |
-            | macOS (Intel) | `opensftp-macos-x86_64` | Intel Macs, `chmod +x` and run |
             | Windows | `opensftp-windows-x86_64.exe` | Double-click to run |
+
+            Intel Macs: use the universal `.app` bundle from the 0.1.0 release, or build from source.
+            The macOS builds are not code-signed — right-click the app and choose **Open** on first launch.
 
             ### Getting started
             Download the binary for your platform, make it executable (`chmod +x` on macOS/Linux), and run it. No installation required.
