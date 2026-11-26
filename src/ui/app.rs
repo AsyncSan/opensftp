@@ -10,11 +10,12 @@ use iced::futures::stream;
 use tokio::sync::mpsc;
 use super::icons;
 
-use crate::core::sftp::{RemoteEntry, SftpConnection, TransferProgress};
+use crate::core::sftp::{KeyPassphrases, RemoteEntry, SftpConnection, TransferProgress};
 use crate::core::connection::JumpHostConfig;
 use crate::theme::{AppTheme, InstallMode, Settings};
 use crate::ui::connect_dialog::{self, ConnectMessage, ConnectState};
 use crate::ui::file_panel::{self, FileEntry, PanelMessage, SortColumn};
+use crate::ui::session_store::{SavedServer, SavedSession, SavedTab};
 #[allow(unused_imports)]
 use super::helpers::{format_size, format_permissions, format_timestamp, remote_to_file_entries, parent_path, sort_entries, read_local_dir};
 
@@ -35,8 +36,8 @@ pub enum Message {
     Disconnect,
     CycleTheme,
     // Async results
-    Connected(Arc<SftpConnection>, Vec<RemoteEntry>, String),
-    ConnectionFailed(String),
+    Connected(SessionId, Arc<SftpConnection>, Vec<RemoteEntry>, String),
+    ConnectionFailed(SessionId, String),
     RemoteListing(Vec<RemoteEntry>, String),
     RemoteListingFailed(String),
     Disconnected,
@@ -127,13 +128,19 @@ pub enum Message {
 impl std::fmt::Debug for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Connect(
+                ConnectMessage::PasswordChanged(_)
+                | ConnectMessage::JumpPasswordChanged(_)
+                | ConnectMessage::KeyPassphraseChanged(_)
+                | ConnectMessage::JumpKeyPassphraseChanged(_),
+            ) => write!(f, "Connect(<secret input>)"),
             Self::Connect(m) => write!(f, "Connect({:?})", m),
             Self::LocalPanel(m) => write!(f, "LocalPanel({:?})", m),
             Self::RemotePanel(m) => write!(f, "RemotePanel({:?})", m),
             Self::Disconnect => write!(f, "Disconnect"),
             Self::CycleTheme => write!(f, "CycleTheme"),
-            Self::Connected(_, _, h) => write!(f, "Connected(home={})", h),
-            Self::ConnectionFailed(e) => write!(f, "ConnectionFailed({})", e),
+            Self::Connected(id, _, _, h) => write!(f, "Connected(tab={}, path={})", id, h),
+            Self::ConnectionFailed(id, e) => write!(f, "ConnectionFailed(tab={}, {})", id, e),
             Self::RemoteListing(_, p) => write!(f, "RemoteListing({})", p),
             Self::RemoteListingFailed(e) => write!(f, "RemoteListingFailed({})", e),
             Self::Disconnected => write!(f, "Disconnected"),
@@ -316,6 +323,10 @@ pub struct Session {
     pub terminal_history_idx: Option<usize>,
     pub drop_hovering: bool,
     pub drop_pending: Vec<PathBuf>,
+    /// Server this tab should reconnect to after a restart. Kept while the
+    /// reconnect is running or has failed, so the tab is not lost from the
+    /// saved session.
+    pub restore_target: Option<SavedServer>,
 }
 
 pub struct App {
@@ -328,6 +339,10 @@ pub struct App {
     modifiers: Modifiers,
     show_bookmarks_bar: bool,
     show_log: bool,
+    /// Last session state written to disk, to skip identical writes.
+    last_saved: Option<SavedSession>,
+    /// Off in tests and until startup restore has run.
+    persist: bool,
 }
 
 impl Session {
@@ -401,6 +416,7 @@ impl Session {
             terminal_history_idx: None,
             drop_hovering: false,
             drop_pending: Vec::new(),
+            restore_target: None,
         }
     }
 }
@@ -424,12 +440,162 @@ impl Default for App {
             modifiers: Modifiers::default(),
             show_bookmarks_bar: true,
             show_log: false,
+            last_saved: None,
+            persist: false,
         }
     }
 }
 
 impl App {
+    /// Start-up entry point: restores the tabs of the last run and starts
+    /// reconnecting them.
+    pub fn new() -> (Self, Task<Message>) {
+        let mut app = Self::default();
+        let task = match SavedSession::load() {
+            Some(saved) => app.restore_session(saved),
+            None => Task::none(),
+        };
+        app.last_saved = Some(app.session_snapshot());
+        app.persist = true;
+        (app, task)
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        if self.persist {
+            let snapshot = self.session_snapshot();
+            if self.last_saved.as_ref() != Some(&snapshot) {
+                snapshot.save();
+                self.last_saved = Some(snapshot);
+            }
+        }
+        task
+    }
+
+    fn session_index(&self, id: SessionId) -> Option<usize> {
+        self.sessions.iter().position(|s| s.id == id)
+    }
+
+    /// Listings arrive in server or file system order; put a freshly loaded
+    /// listing into the tab's chosen sort order, so the order survives
+    /// navigation and restarts.
+    fn sort_local(&mut self, i: usize) {
+        let s = &mut self.sessions[i];
+        sort_entries(&mut s.local_entries, s.sort_column, s.sort_ascending);
+    }
+
+    fn sort_remote(&mut self, i: usize) {
+        let s = &mut self.sessions[i];
+        sort_entries(&mut s.remote_entries, s.sort_column, s.sort_ascending);
+    }
+
+    /// Connect tab `idx` with its current connect form. With `start_path`,
+    /// open that remote directory instead of the home directory.
+    fn connect_task(&mut self, idx: usize, start_path: Option<String>) -> Task<Message> {
+        let session = &mut self.sessions[idx];
+        session.screen = Screen::Connecting;
+        session.status = format!(
+            "Connecting to {}:{}...",
+            session.connect_state.host, session.connect_state.port
+        );
+        let id = session.id;
+        let host = session.connect_state.host.clone();
+        let port: u16 = session.connect_state.port.parse().unwrap_or(22);
+        let username = session.connect_state.username.clone();
+        let auth = session.connect_state.auth_method();
+        let jump_host: Option<JumpHostConfig> = session.connect_state.jump_host_config();
+        let passphrases = session.connect_state.key_passphrases();
+        Task::perform(
+            connect_and_list(host, port, username, auth, jump_host, passphrases, start_path),
+            move |result| match result {
+                Ok((conn, entries, path)) => Message::Connected(id, conn, entries, path),
+                Err(e) => Message::ConnectionFailed(id, e.to_string()),
+            },
+        )
+    }
+
+    /// What gets written to session.json.
+    fn session_snapshot(&self) -> SavedSession {
+        let tabs = self
+            .sessions
+            .iter()
+            .map(|s| {
+                let server = if s.screen == Screen::Browser && s.sftp.is_some() {
+                    Some(SavedServer {
+                        host: s.connect_state.host.clone(),
+                        port: s.connect_state.port.parse().unwrap_or(22),
+                        username: s.connect_state.username.clone(),
+                        remote_path: s.remote_path.clone(),
+                    })
+                } else {
+                    s.restore_target.clone()
+                };
+                SavedTab {
+                    server,
+                    local_path: s.local_path.clone(),
+                    sort_column: s.sort_column,
+                    sort_ascending: s.sort_ascending,
+                }
+            })
+            .collect();
+        SavedSession { tabs, active_tab: self.active_tab }
+    }
+
+    /// Rebuild the tabs of a saved session and reconnect the ones that were
+    /// connected. A server is only reconnected through a saved connection
+    /// profile with the same host, port and user.
+    fn restore_session(&mut self, saved: SavedSession) -> Task<Message> {
+        if saved.tabs.is_empty() {
+            return Task::none();
+        }
+        let first_run_dialog = self.sessions[0].dialog.clone();
+        self.sessions.clear();
+        let mut tasks = Vec::new();
+        for tab in saved.tabs {
+            let id = self.next_session_id;
+            self.next_session_id += 1;
+            let mut session = Session::new(id);
+            if std::path::Path::new(&tab.local_path).is_dir() {
+                session.local_entries = read_local_dir(&tab.local_path, session.show_hidden);
+                session.local_path = tab.local_path;
+            }
+            session.sort_column = tab.sort_column;
+            session.sort_ascending = tab.sort_ascending;
+            sort_entries(&mut session.local_entries, tab.sort_column, tab.sort_ascending);
+            self.sessions.push(session);
+            let idx = self.sessions.len() - 1;
+
+            if let Some(server) = tab.server {
+                let profile = self.sessions[idx]
+                    .connect_state
+                    .profiles
+                    .iter()
+                    .find(|p| p.host == server.host && p.port == server.port && p.username == server.username)
+                    .map(|p| p.name.clone());
+                let session = &mut self.sessions[idx];
+                session.label = format!("{}@{}", server.username, server.host);
+                match profile {
+                    Some(name) => {
+                        session.connect_state.apply_profile(&name);
+                        let path = server.remote_path.clone();
+                        session.restore_target = Some(server);
+                        tasks.push(self.connect_task(idx, Some(path)));
+                    }
+                    None => {
+                        // Profile was deleted: prefill the form, do not connect.
+                        session.connect_state.host = server.host;
+                        session.connect_state.port = server.port.to_string();
+                        session.connect_state.username = server.username;
+                    }
+                }
+            }
+        }
+        self.active_tab = saved.active_tab.min(self.sessions.len() - 1);
+        self.sessions[self.active_tab].dialog = first_run_dialog;
+        Task::batch(tasks)
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Connect(msg) => match msg {
                 ConnectMessage::HostChanged(v) => self.sessions[self.active_tab].connect_state.host = v,
@@ -438,6 +604,7 @@ impl App {
                 ConnectMessage::PasswordChanged(v) => self.sessions[self.active_tab].connect_state.password = v,
                 ConnectMessage::AuthTypeSelected(t) => self.sessions[self.active_tab].connect_state.auth_type = t,
                 ConnectMessage::KeyPathChanged(v) => self.sessions[self.active_tab].connect_state.key_path = v,
+                ConnectMessage::KeyPassphraseChanged(v) => self.sessions[self.active_tab].connect_state.key_passphrase = v,
                 ConnectMessage::JumpHostToggled(enabled) => self.sessions[self.active_tab].connect_state.use_jump_host = enabled,
                 ConnectMessage::JumpHostChanged(v) => self.sessions[self.active_tab].connect_state.jump_host = v,
                 ConnectMessage::JumpPortChanged(v) => self.sessions[self.active_tab].connect_state.jump_port = v,
@@ -445,6 +612,7 @@ impl App {
                 ConnectMessage::JumpPasswordChanged(v) => self.sessions[self.active_tab].connect_state.jump_password = v,
                 ConnectMessage::JumpAuthTypeSelected(t) => self.sessions[self.active_tab].connect_state.jump_auth_type = t,
                 ConnectMessage::JumpKeyPathChanged(v) => self.sessions[self.active_tab].connect_state.jump_key_path = v,
+                ConnectMessage::JumpKeyPassphraseChanged(v) => self.sessions[self.active_tab].connect_state.jump_key_passphrase = v,
                 ConnectMessage::BrowseKeyFile => {
                     return Task::perform(
                         async {
@@ -511,51 +679,54 @@ impl App {
                         self.sessions[self.active_tab].connect_state.host, self.sessions[self.active_tab].connect_state.port
                     );
 
-                    let host = self.sessions[self.active_tab].connect_state.host.clone();
-                    let port: u16 = self.sessions[self.active_tab].connect_state.port.parse().unwrap_or(22);
-                    let username = self.sessions[self.active_tab].connect_state.username.clone();
-                    let auth = self.sessions[self.active_tab].connect_state.auth_method();
-
-                    let jump_host: Option<JumpHostConfig> = self.sessions[self.active_tab].connect_state.jump_host_config();
-                    return Task::perform(
-                        connect_and_list(host, port, username, auth, jump_host),
-                        |result| match result {
-                            Ok((conn, entries, home)) => Message::Connected(conn, entries, home),
-                            Err(e) => Message::ConnectionFailed(e.to_string()),
-                        },
-                    );
+                    // Retrying a restored tab (say, after typing a key
+                    // passphrase) still opens its saved directory.
+                    let cs = &self.sessions[self.active_tab].connect_state;
+                    let start_path = self.sessions[self.active_tab]
+                        .restore_target
+                        .as_ref()
+                        .filter(|t| t.host == cs.host && t.port.to_string() == cs.port && t.username == cs.username)
+                        .map(|t| t.remote_path.clone());
+                    return self.connect_task(self.active_tab, start_path);
                 }
                 ConnectMessage::Cancel => {
                     self.sessions[self.active_tab].connect_state = ConnectState::new();
                 }
             },
 
-            Message::Connected(conn, entries, home) => {
-                self.sessions[self.active_tab].label = format!("{}@{}", self.sessions[self.active_tab].connect_state.username, self.sessions[self.active_tab].connect_state.host);
-                self.sessions[self.active_tab].status = format!("Connected to {}", self.sessions[self.active_tab].connect_state.host);
-                self.sessions[self.active_tab].screen = Screen::Browser;
-                self.sessions[self.active_tab].sftp = Some(conn);
-                self.sessions[self.active_tab].remote_path = home;
-                self.sessions[self.active_tab].remote_entries = remote_to_file_entries(&entries, self.sessions[self.active_tab].show_hidden);
-                self.sessions[self.active_tab].connected_at = Some(Instant::now());
+            Message::Connected(id, conn, entries, home) => {
+                let Some(i) = self.session_index(id) else {
+                    // Tab was closed while connecting.
+                    tokio::spawn(async move { let _ = conn.close().await; });
+                    return Task::none();
+                };
+                self.sessions[i].restore_target = None;
+                self.sessions[i].label = format!("{}@{}", self.sessions[i].connect_state.username, self.sessions[i].connect_state.host);
+                self.sessions[i].status = format!("Connected to {}", self.sessions[i].connect_state.host);
+                self.sessions[i].screen = Screen::Browser;
+                self.sessions[i].sftp = Some(conn);
+                self.sessions[i].remote_path = home;
+                self.sessions[i].remote_entries = remote_to_file_entries(&entries, self.sessions[i].show_hidden);
+                self.sort_remote(i);
+                self.sessions[i].connected_at = Some(Instant::now());
 
                 // Auto-save connection profile
                 {
                     use crate::core::connection::ConnectionProfile;
-                    let host = &self.sessions[self.active_tab].connect_state.host;
-                    let username = &self.sessions[self.active_tab].connect_state.username;
-                    let port: u16 = self.sessions[self.active_tab].connect_state.port.parse().unwrap_or(22);
+                    let host = &self.sessions[i].connect_state.host;
+                    let username = &self.sessions[i].connect_state.username;
+                    let port: u16 = self.sessions[i].connect_state.port.parse().unwrap_or(22);
                     let auto_name = format!("{}@{}", username, host);
                     let profile = ConnectionProfile {
                         name: auto_name.clone(),
                         host: host.clone(),
                         port,
                         username: username.clone(),
-                        auth: self.sessions[self.active_tab].connect_state.auth_method(),
+                        auth: self.sessions[i].connect_state.auth_method(),
                         favorite: false,
-                        jump_host: self.sessions[self.active_tab].connect_state.jump_host_config(),
+                        jump_host: self.sessions[i].connect_state.jump_host_config(),
                     };
-                    let mut profiles = self.sessions[self.active_tab].connect_state.profiles.clone();
+                    let mut profiles = self.sessions[i].connect_state.profiles.clone();
                     if let Some(existing) = profiles.iter_mut().find(|p| p.host == *host && p.username == *username && p.port == port) {
                         existing.auth = profile.auth;
                         existing.jump_host = profile.jump_host;
@@ -563,13 +734,16 @@ impl App {
                         profiles.push(profile);
                     }
                     let _ = ConnectionProfile::save_all(&profiles);
-                    self.sessions[self.active_tab].connect_state.profiles = profiles;
+                    self.sessions[i].connect_state.profiles = profiles;
                 }
             }
 
-            Message::ConnectionFailed(err) => {
-                self.sessions[self.active_tab].screen = Screen::Connect;
-                self.sessions[self.active_tab].status = format!("Failed: {}", err);
+            Message::ConnectionFailed(id, err) => {
+                let Some(i) = self.session_index(id) else {
+                    return Task::none();
+                };
+                self.sessions[i].screen = Screen::Connect;
+                self.sessions[i].status = format!("Failed: {}", err);
             }
 
             Message::LocalPanel(msg) => {
@@ -595,6 +769,7 @@ impl App {
                                     format!("{}/{}", self.sessions[self.active_tab].local_path, entry.name)
                                 };
                                 self.sessions[self.active_tab].local_entries = read_local_dir(&new_path, self.sessions[self.active_tab].show_hidden);
+                                self.sort_local(self.active_tab);
                                 self.sessions[self.active_tab].local_path = new_path;
                                 self.sessions[self.active_tab].local_selected.clear();
                                 self.sessions[self.active_tab].last_anchor_local = None;
@@ -629,6 +804,7 @@ impl App {
                         if let Some(parent) = std::path::Path::new(&self.sessions[self.active_tab].local_path).parent() {
                             let new_path = parent.to_string_lossy().to_string();
                             self.sessions[self.active_tab].local_entries = read_local_dir(&new_path, self.sessions[self.active_tab].show_hidden);
+                            self.sort_local(self.active_tab);
                             self.sessions[self.active_tab].local_path = new_path;
                             self.sessions[self.active_tab].local_selected.clear();
                             self.sessions[self.active_tab].local_filter.clear();
@@ -639,15 +815,18 @@ impl App {
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|| "/".to_string());
                         self.sessions[self.active_tab].local_entries = read_local_dir(&home, self.sessions[self.active_tab].show_hidden);
+                        self.sort_local(self.active_tab);
                         self.sessions[self.active_tab].local_path = home;
                         self.sessions[self.active_tab].local_selected.clear();
                         self.sessions[self.active_tab].local_filter.clear();
                     }
                     PanelMessage::Refresh => {
                         self.sessions[self.active_tab].local_entries = read_local_dir(&self.sessions[self.active_tab].local_path, self.sessions[self.active_tab].show_hidden);
+                        self.sort_local(self.active_tab);
                     }
                     PanelMessage::PathSegmentClicked(path) => {
                         self.sessions[self.active_tab].local_entries = read_local_dir(&path, self.sessions[self.active_tab].show_hidden);
+                        self.sort_local(self.active_tab);
                         self.sessions[self.active_tab].local_path = path;
                         self.sessions[self.active_tab].local_selected.clear();
                         self.sessions[self.active_tab].local_filter.clear();
@@ -848,6 +1027,7 @@ impl App {
             Message::RemoteListing(entries, path) => {
                 self.sessions[self.active_tab].remote_path = path;
                 self.sessions[self.active_tab].remote_entries = remote_to_file_entries(&entries, self.sessions[self.active_tab].show_hidden);
+                self.sort_remote(self.active_tab);
                 self.sessions[self.active_tab].remote_selected.clear();
             }
 
@@ -1042,6 +1222,7 @@ impl App {
 
                 // Refresh both panels
                 self.sessions[self.active_tab].local_entries = read_local_dir(&self.sessions[self.active_tab].local_path, self.sessions[self.active_tab].show_hidden);
+                self.sort_local(self.active_tab);
                 let mut tasks: Vec<Task<Message>> = Vec::new();
 
                 if let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
@@ -1089,6 +1270,7 @@ impl App {
 
             Message::Disconnect => {
                 let sftp = self.sessions[self.active_tab].sftp.take();
+                self.sessions[self.active_tab].restore_target = None;
                 self.sessions[self.active_tab].screen = Screen::Connect;
                 self.sessions[self.active_tab].status = "Disconnecting...".to_string();
                 self.sessions[self.active_tab].remote_entries.clear();
@@ -1276,6 +1458,7 @@ impl App {
                             Ok(_) => {
                                 self.sessions[self.active_tab].status = format!("Created directory: {}", name);
                                 self.sessions[self.active_tab].local_entries = read_local_dir(&self.sessions[self.active_tab].local_path, self.sessions[self.active_tab].show_hidden);
+                                self.sort_local(self.active_tab);
                             }
                             Err(e) => {
                                 self.sessions[self.active_tab].status = format!("Error: {}", e);
@@ -1331,6 +1514,7 @@ impl App {
                         self.sessions[self.active_tab].status = format!("Deleted {} item(s)", deleted);
                         self.sessions[self.active_tab].local_selected.clear();
                         self.sessions[self.active_tab].local_entries = read_local_dir(&self.sessions[self.active_tab].local_path, self.sessions[self.active_tab].show_hidden);
+                        self.sort_local(self.active_tab);
                     }
                     self.sessions[self.active_tab].dialog = Dialog::None;
                 }
@@ -1361,6 +1545,7 @@ impl App {
                                 self.sessions[self.active_tab].status = format!("Renamed: {} -> {}", old, new);
                                 self.sessions[self.active_tab].local_selected.clear();
                                 self.sessions[self.active_tab].local_entries = read_local_dir(&self.sessions[self.active_tab].local_path, self.sessions[self.active_tab].show_hidden);
+                                self.sort_local(self.active_tab);
                             }
                             Err(e) => {
                                 self.sessions[self.active_tab].status = format!("Error: {}", e);
@@ -1486,6 +1671,7 @@ impl App {
             Message::ToggleHidden => {
                 self.sessions[self.active_tab].show_hidden = !self.sessions[self.active_tab].show_hidden;
                 self.sessions[self.active_tab].local_entries = read_local_dir(&self.sessions[self.active_tab].local_path, self.sessions[self.active_tab].show_hidden);
+                self.sort_local(self.active_tab);
                 if !self.sessions[self.active_tab].show_hidden { self.sessions[self.active_tab].local_filter.clear(); }
                 // Re-fetch remote listing with new filter
                 if let Some(conn) = self.sessions[self.active_tab].sftp.clone() {
@@ -1589,6 +1775,7 @@ impl App {
                                             format!("{}/{}", self.sessions[self.active_tab].local_path, entry.name)
                                         };
                                         self.sessions[self.active_tab].local_entries = read_local_dir(&new_path, self.sessions[self.active_tab].show_hidden);
+                                        self.sort_local(self.active_tab);
                                         self.sessions[self.active_tab].local_path = new_path;
                                         self.sessions[self.active_tab].local_selected.clear();
                                         self.sessions[self.active_tab].last_anchor_local = None;
@@ -1677,6 +1864,7 @@ impl App {
                         return match ctx {
                             ContextMenu::Local(_) => {
                                 self.sessions[self.active_tab].local_entries = read_local_dir(&self.sessions[self.active_tab].local_path, self.sessions[self.active_tab].show_hidden);
+                                self.sort_local(self.active_tab);
                                 Task::none()
                             }
                             ContextMenu::Remote(_) => {
@@ -1938,8 +2126,11 @@ impl App {
                             ActivePanel::Remote => self.update(Message::RemoteRename),
                         };
                     }
-                    // F4: Toggle terminal
+                    // F4 or Ctrl+`: Toggle terminal
                     Key::Named(keyboard::key::Named::F4) => {
+                        return self.update(Message::ToggleTerminal);
+                    }
+                    Key::Character(ref c) if c.as_str() == "`" && mods.control() => {
                         return self.update(Message::ToggleTerminal);
                     }
                     // F5: Copy selected to other panel (Norton Commander style)
@@ -2078,6 +2269,7 @@ impl App {
                                                 format!("{}/{}", self.sessions[self.active_tab].local_path, entry.name)
                                             };
                                             self.sessions[self.active_tab].local_entries = read_local_dir(&new_path, self.sessions[self.active_tab].show_hidden);
+                                            self.sort_local(self.active_tab);
                                             self.sessions[self.active_tab].local_path = new_path;
                                             self.sessions[self.active_tab].local_selected.clear();
                                             self.sessions[self.active_tab].last_anchor_local = None;
@@ -3285,11 +3477,13 @@ async fn connect_and_list(
     username: String,
     auth: crate::core::connection::AuthMethod,
     jump_host: Option<JumpHostConfig>,
+    passphrases: KeyPassphrases,
+    start_path: Option<String>,
 ) -> ConnectResult {
     let conn = if let Some(jump) = jump_host {
-        SftpConnection::connect_with_jump_host(&host, port, &username, &auth, &jump).await?
+        SftpConnection::connect_with_jump_host(&host, port, &username, &auth, &jump, &passphrases).await?
     } else {
-        SftpConnection::connect(&host, port, &username, &auth).await?
+        SftpConnection::connect(&host, port, &username, &auth, &passphrases).await?
     };
     let conn = Arc::new(conn);
 
@@ -3298,6 +3492,13 @@ async fn connect_and_list(
         .canonicalize(".")
         .await
         .unwrap_or_else(|_| "/".to_string());
+
+    // A restored tab goes back to its last directory, if it still exists.
+    if let Some(path) = start_path
+        && let Ok(entries) = conn.list_dir(&path).await
+    {
+        return Ok((conn, entries, path));
+    }
 
     let entries = conn.list_dir(&home).await?;
     Ok((conn, entries, home))
@@ -3351,6 +3552,143 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_dir_string() -> String {
+        std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string()
+    }
+
+    #[test]
+    fn restore_tab_without_server_keeps_path_and_sort() {
+        let saved = SavedSession {
+            tabs: vec![SavedTab {
+                server: None,
+                local_path: tmp_dir_string(),
+                sort_column: SortColumn::Size,
+                sort_ascending: false,
+            }],
+            active_tab: 0,
+        };
+        let mut app = App::default();
+        let _ = app.restore_session(saved.clone());
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].local_path, tmp_dir_string());
+        assert_eq!(app.sessions[0].sort_column, SortColumn::Size);
+        assert!(!app.sessions[0].sort_ascending);
+        assert_eq!(app.sessions[0].screen, Screen::Connect);
+        assert_eq!(app.session_snapshot(), saved);
+    }
+
+    #[test]
+    fn restore_reconnects_tabs_with_profile_and_keeps_them_on_failure() {
+        use crate::core::connection::{AuthMethod, ConnectionProfile};
+        ConnectionProfile::save_all(&[ConnectionProfile {
+            name: "deploy@example.com".into(),
+            host: "example.com".into(),
+            port: 2222,
+            username: "deploy".into(),
+            auth: AuthMethod::Agent,
+            favorite: false,
+            jump_host: None,
+        }])
+        .unwrap();
+        let saved = SavedSession {
+            tabs: vec![
+                SavedTab {
+                    server: None,
+                    local_path: tmp_dir_string(),
+                    sort_column: SortColumn::Name,
+                    sort_ascending: true,
+                },
+                SavedTab {
+                    server: Some(SavedServer {
+                        host: "example.com".into(),
+                        port: 2222,
+                        username: "deploy".into(),
+                        remote_path: "/var/www".into(),
+                    }),
+                    local_path: tmp_dir_string(),
+                    sort_column: SortColumn::Modified,
+                    sort_ascending: false,
+                },
+            ],
+            active_tab: 1,
+        };
+        let mut app = App::default();
+        let _ = app.restore_session(saved.clone());
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.sessions[1].screen, Screen::Connecting);
+        assert_eq!(app.sessions[1].connect_state.port, "2222");
+        assert_eq!(app.sessions[1].label, "deploy@example.com");
+        // While connecting, the saved session still lists the server.
+        assert_eq!(app.session_snapshot(), saved);
+
+        // A failed reconnect (server down, key needs a passphrase) keeps the tab.
+        let id = app.sessions[1].id;
+        app.update(Message::ConnectionFailed(id, "refused".into()));
+        assert_eq!(app.sessions[1].screen, Screen::Connect);
+        assert_eq!(app.session_snapshot(), saved);
+
+        // Results for a tab are routed by id, not to whichever tab is active.
+        app.active_tab = 0;
+        let first = app.sessions[0].id;
+        app.sessions[0].screen = Screen::Connecting;
+        app.update(Message::ConnectionFailed(first, "timeout".into()));
+        assert!(app.sessions[0].status.contains("timeout"));
+        assert!(app.sessions[1].status.contains("refused"));
+    }
+
+    #[test]
+    fn restore_without_profile_prefills_but_does_not_connect() {
+        let saved = SavedSession {
+            tabs: vec![SavedTab {
+                server: Some(SavedServer {
+                    host: "gone.example.com".into(),
+                    port: 22,
+                    username: "old".into(),
+                    remote_path: "/srv".into(),
+                }),
+                local_path: "/definitely/not/here".into(),
+                sort_column: SortColumn::Name,
+                sort_ascending: true,
+            }],
+            active_tab: 5,
+        };
+        let mut app = App::default();
+        let _ = app.restore_session(saved);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.sessions[0].screen, Screen::Connect);
+        assert_eq!(app.sessions[0].connect_state.host, "gone.example.com");
+        assert!(app.sessions[0].restore_target.is_none());
+        // Missing local directory falls back to the home directory.
+        assert_ne!(app.sessions[0].local_path, "/definitely/not/here");
+    }
+
+    #[test]
+    fn ctrl_backtick_toggles_terminal() {
+        let mut app = App::default();
+        app.sessions[0].screen = Screen::Browser;
+        let mut mods = Modifiers::default();
+        mods.insert(Modifiers::CTRL);
+        app.update(Message::KeyPressed(Key::Character("`".into()), mods));
+        assert!(app.sessions[0].show_terminal);
+        app.update(Message::KeyPressed(Key::Character("`".into()), mods));
+        assert!(!app.sessions[0].show_terminal);
+    }
+
+    #[test]
+    fn remote_listing_follows_sort_order() {
+        let mut app = App::default();
+        app.sessions[0].sort_column = SortColumn::Size;
+        app.sessions[0].sort_ascending = false;
+        let entries = vec![
+            RemoteEntry { name: "small".into(), is_dir: false, size: 1, mtime: 0, permissions: 0o644 },
+            RemoteEntry { name: "big".into(), is_dir: false, size: 100, mtime: 0, permissions: 0o644 },
+        ];
+        app.update(Message::RemoteListing(entries, "/x".into()));
+        let names: Vec<_> = app.sessions[0].remote_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["..", "big", "small"]);
+    }
 
     #[test]
     fn format_timestamp_zero() {
@@ -3564,7 +3902,8 @@ mod tests {
     fn smoke_connection_failed_returns_to_connect() {
         let mut app = App::default();
         app.sessions[0].screen = Screen::Connecting;
-        app.update(Message::ConnectionFailed("timeout".into()));
+        let id = app.sessions[0].id;
+        app.update(Message::ConnectionFailed(id, "timeout".into()));
         assert_eq!(app.sessions[0].screen, Screen::Connect);
         assert!(app.sessions[0].status.contains("timeout"));
     }
@@ -4824,7 +5163,8 @@ mod tests {
         assert!(app.sessions[0].status.contains("192.168.1.99"));
 
         // Simulate failure
-        app.update(Message::ConnectionFailed("Connection refused".into()));
+        let id = app.sessions[app.active_tab].id;
+        app.update(Message::ConnectionFailed(id, "Connection refused".into()));
         assert_eq!(app.sessions[0].screen, Screen::Connect);
         assert!(app.sessions[0].status.contains("Connection refused"));
 

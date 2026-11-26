@@ -114,14 +114,14 @@ impl PythonProfile {
 
 impl ConnectionProfile {
     pub fn profiles_path() -> PathBuf {
-        let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let mut p = crate::core::config_dir();
         p.push("eurosftp");
         p.push("connections.json");
         p
     }
 
     fn python_profiles_path() -> PathBuf {
-        let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let mut p = crate::core::config_dir();
         p.push("sftp-ui");
         p.push("connections.json");
         p

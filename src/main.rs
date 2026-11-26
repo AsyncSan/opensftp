@@ -10,5 +10,5 @@ fn main() -> iced::Result {
         .subscription(ui::app::App::subscription)
         .window_size(iced::Size::new(1200.0, 750.0))
         .default_font(Font::MONOSPACE)
-        .run()
+        .run_with(ui::app::App::new)
 }

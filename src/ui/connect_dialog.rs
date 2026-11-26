@@ -29,6 +29,7 @@ pub enum ConnectMessage {
     PasswordChanged(String),
     AuthTypeSelected(AuthType),
     KeyPathChanged(String),
+    KeyPassphraseChanged(String),
     BrowseKeyFile,
     KeyFileChosen(Option<String>),
     JumpHostToggled(bool),
@@ -38,6 +39,7 @@ pub enum ConnectMessage {
     JumpPasswordChanged(String),
     JumpAuthTypeSelected(AuthType),
     JumpKeyPathChanged(String),
+    JumpKeyPassphraseChanged(String),
     Connect,
     Cancel,
     ProfileSelected(String),
@@ -54,6 +56,8 @@ pub struct ConnectState {
     pub password: String,
     pub auth_type: AuthType,
     pub key_path: String,
+    /// Only kept in memory, never saved to a profile.
+    pub key_passphrase: String,
     pub use_jump_host: bool,
     pub jump_host: String,
     pub jump_port: String,
@@ -61,6 +65,7 @@ pub struct ConnectState {
     pub jump_password: String,
     pub jump_auth_type: AuthType,
     pub jump_key_path: String,
+    pub jump_key_passphrase: String,
     pub profiles: Vec<ConnectionProfile>,
     pub selected_profile: Option<String>,
 }
@@ -74,6 +79,7 @@ impl Default for ConnectState {
             password: String::new(),
             auth_type: AuthType::Password,
             key_path: String::new(),
+            key_passphrase: String::new(),
             use_jump_host: false,
             jump_host: String::new(),
             jump_port: "22".to_string(),
@@ -81,6 +87,7 @@ impl Default for ConnectState {
             jump_password: String::new(),
             jump_auth_type: AuthType::KeyFile,
             jump_key_path: String::new(),
+            jump_key_passphrase: String::new(),
             profiles: Vec::new(),
             selected_profile: None,
         }
@@ -88,6 +95,14 @@ impl Default for ConnectState {
 }
 
 impl ConnectState {
+    pub fn key_passphrases(&self) -> crate::core::sftp::KeyPassphrases {
+        let opt = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
+        crate::core::sftp::KeyPassphrases {
+            target: opt(&self.key_passphrase),
+            jump: opt(&self.jump_key_passphrase),
+        }
+    }
+
     pub fn new() -> Self {
         let profiles = ConnectionProfile::load_all();
         let default_key = dirs::home_dir()
@@ -250,7 +265,7 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
 
     let auth_selector = row![text("Auth:").size(13), pick_list(vec![AuthType::Password, AuthType::KeyFile, AuthType::Agent], Some(state.auth_type), ConnectMessage::AuthTypeSelected),].spacing(8).align_y(iced::Alignment::Center);
 
-    let auth_fields: Element<'_, ConnectMessage> = match state.auth_type { AuthType::Password => text_input("Password", &state.password).on_input(ConnectMessage::PasswordChanged).padding(8).secure(true).into(), AuthType::KeyFile => row![text_input("Key file path", &state.key_path).on_input(ConnectMessage::KeyPathChanged).padding(8).width(Length::Fill), button("Browse").on_press(ConnectMessage::BrowseKeyFile).padding(8),].spacing(8).into(), AuthType::Agent => text("Uses SSH_AUTH_SOCK agent").size(13).into(), };
+    let auth_fields: Element<'_, ConnectMessage> = match state.auth_type { AuthType::Password => text_input("Password", &state.password).on_input(ConnectMessage::PasswordChanged).padding(8).secure(true).into(), AuthType::KeyFile => column![row![text_input("Key file path", &state.key_path).on_input(ConnectMessage::KeyPathChanged).padding(8).width(Length::Fill), button("Browse").on_press(ConnectMessage::BrowseKeyFile).padding(8),].spacing(8), text_input("Key passphrase (empty if none, not saved)", &state.key_passphrase).on_input(ConnectMessage::KeyPassphraseChanged).padding(8).secure(true),].spacing(8).into(), AuthType::Agent => text("Uses SSH_AUTH_SOCK agent").size(13).into(), };
 
     let jump_auth_selector = row![text("Jump auth:").size(13), pick_list(vec![AuthType::Password, AuthType::KeyFile, AuthType::Agent], Some(state.jump_auth_type), ConnectMessage::JumpAuthTypeSelected),].spacing(8).align_y(iced::Alignment::Center);
 
@@ -262,7 +277,7 @@ pub fn view_connect_dialog(state: &ConnectState) -> Element<'_, ConnectMessage> 
                 text_input("Jump username", &state.jump_username).on_input(ConnectMessage::JumpUsernameChanged).padding(8).width(Length::Fill),
             ].spacing(8),
             jump_auth_selector,
-            {let jump_auth_field: Element<'_, ConnectMessage> = match state.jump_auth_type { AuthType::Password => text_input("Jump password", &state.jump_password).on_input(ConnectMessage::JumpPasswordChanged).padding(8).secure(true).into(), AuthType::KeyFile => row![text_input("Jump key file path", &state.jump_key_path).on_input(ConnectMessage::JumpKeyPathChanged).padding(8).width(Length::Fill), button("Browse").on_press(ConnectMessage::BrowseKeyFile).padding(8),].spacing(8).into(), AuthType::Agent => text("Jump uses SSH_AUTH_SOCK agent").size(13).into(), }; jump_auth_field},
+            {let jump_auth_field: Element<'_, ConnectMessage> = match state.jump_auth_type { AuthType::Password => text_input("Jump password", &state.jump_password).on_input(ConnectMessage::JumpPasswordChanged).padding(8).secure(true).into(), AuthType::KeyFile => column![row![text_input("Jump key file path", &state.jump_key_path).on_input(ConnectMessage::JumpKeyPathChanged).padding(8).width(Length::Fill), button("Browse").on_press(ConnectMessage::BrowseKeyFile).padding(8),].spacing(8), text_input("Jump key passphrase (empty if none, not saved)", &state.jump_key_passphrase).on_input(ConnectMessage::JumpKeyPassphraseChanged).padding(8).secure(true),].spacing(8).into(), AuthType::Agent => text("Jump uses SSH_AUTH_SOCK agent").size(13).into(), }; jump_auth_field},
         ].spacing(8).into()
     } else { container(text("")).height(Length::Shrink).into() };
 

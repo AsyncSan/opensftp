@@ -62,24 +62,25 @@ pub fn parent_path(path: &str) -> String {
     }
 }
 
+fn compare_entries(a: &FileEntry, b: &FileEntry, column: SortColumn, ascending: bool) -> std::cmp::Ordering {
+    let dir_cmp = b.is_dir.cmp(&a.is_dir);
+    if dir_cmp != std::cmp::Ordering::Equal {
+        return dir_cmp;
+    }
+    let cmp = match column {
+        SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortColumn::Size => a.size.cmp(&b.size),
+        SortColumn::Modified => a.modified.cmp(&b.modified),
+        SortColumn::Permissions => a.permissions.cmp(&b.permissions),
+    };
+    if ascending { cmp } else { cmp.reverse() }
+}
+
 pub fn sort_entries(entries: &mut [FileEntry], column: SortColumn, ascending: bool) {
     if entries.len() <= 1 {
         return;
     }
-    let rest = &mut entries[1..];
-    rest.sort_by(|a, b| {
-        let dir_cmp = b.is_dir.cmp(&a.is_dir);
-        if dir_cmp != std::cmp::Ordering::Equal {
-            return dir_cmp;
-        }
-        let cmp = match column {
-            SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            SortColumn::Size => a.size.cmp(&b.size),
-            SortColumn::Modified => a.modified.cmp(&b.modified),
-            SortColumn::Permissions => a.permissions.cmp(&b.permissions),
-        };
-        if ascending { cmp } else { cmp.reverse() }
-    });
+    entries[1..].sort_by(|a, b| compare_entries(a, b, column, ascending));
 }
 
 pub fn read_local_dir(path: &str, show_hidden: bool) -> Vec<FileEntry> {

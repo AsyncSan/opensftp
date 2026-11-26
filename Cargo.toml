@@ -2,6 +2,8 @@
 name = "opensftp"
 version = "0.1.1"
 edition = "2024"
+# let-chains need 1.88; several dependencies already need 1.87.
+rust-version = "1.88"
 description = "A modern, fast SFTP client"
 license = "MIT"
 repository = "https://github.com/AsyncSan/opensftp"
@@ -19,6 +21,10 @@ dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
+# Already in the tree through russh; used directly for hashed known_hosts entries.
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
 
 [profile.release]
 opt-level = "z"

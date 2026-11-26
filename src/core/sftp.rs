@@ -27,6 +27,14 @@ impl client::Handler for SshHandler {
     }
 }
 
+/// Passphrases for encrypted key files. Held only in memory for one connect,
+/// never written to the connection profiles.
+#[derive(Debug, Clone, Default)]
+pub struct KeyPassphrases {
+    pub target: Option<String>,
+    pub jump: Option<String>,
+}
+
 pub struct SftpConnection {
     pub sftp: SftpSession,
     handle: client::Handle<SshHandler>,
@@ -38,8 +46,9 @@ impl SftpConnection {
         port: u16,
         username: &str,
         auth: &AuthMethod,
+        passphrases: &KeyPassphrases,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_inner(host, port, username, auth, None).await
+        Self::connect_inner(host, port, username, auth, None, passphrases).await
     }
 
     pub async fn connect_with_jump_host(
@@ -48,8 +57,9 @@ impl SftpConnection {
         username: &str,
         auth: &AuthMethod,
         jump_host: &JumpHostConfig,
+        passphrases: &KeyPassphrases,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::connect_inner(host, port, username, auth, Some(jump_host)).await
+        Self::connect_inner(host, port, username, auth, Some(jump_host), passphrases).await
     }
 
     async fn connect_inner(
@@ -58,10 +68,11 @@ impl SftpConnection {
         username: &str,
         auth: &AuthMethod,
         jump_host: Option<&JumpHostConfig>,
+        passphrases: &KeyPassphrases,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config = Arc::new(client::Config::default());
         let handle = if let Some(jump) = jump_host {
-            let jump_handle = Self::connect_ssh(&config, &jump.host, jump.port, &jump.username, &jump.auth).await?;
+            let jump_handle = Self::connect_ssh(&config, &jump.host, jump.port, &jump.username, &jump.auth, passphrases.jump.as_deref()).await?;
             let channel = jump_handle.channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0).await?;
             let stream = channel.into_stream();
             client::connect_stream(
@@ -86,7 +97,7 @@ impl SftpConnection {
             .await?
         };
 
-        Self::authenticate_and_open_sftp(handle, username, auth).await
+        Self::authenticate_and_open_sftp(handle, username, auth, passphrases.target.as_deref()).await
     }
 
     async fn connect_ssh(
@@ -95,6 +106,7 @@ impl SftpConnection {
         port: u16,
         username: &str,
         auth: &AuthMethod,
+        passphrase: Option<&str>,
     ) -> Result<client::Handle<SshHandler>, Box<dyn std::error::Error + Send + Sync>> {
         let addr = format!("{}:{}", host, port);
         let mut handle = client::connect(
@@ -106,7 +118,7 @@ impl SftpConnection {
             },
         )
         .await?;
-        let auth_result: client::AuthResult = Self::authenticate(&mut handle, username, auth).await?;
+        let auth_result: client::AuthResult = Self::authenticate(&mut handle, username, auth, passphrase).await?;
         if !auth_result.success() {
             return Err("Authentication failed".into());
         }
@@ -117,8 +129,9 @@ impl SftpConnection {
         mut handle: client::Handle<SshHandler>,
         username: &str,
         auth: &AuthMethod,
+        passphrase: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let auth_result: client::AuthResult = Self::authenticate(&mut handle, username, auth).await?;
+        let auth_result: client::AuthResult = Self::authenticate(&mut handle, username, auth, passphrase).await?;
         if !auth_result.success() {
             return Err("Authentication failed".into());
         }
@@ -132,17 +145,28 @@ impl SftpConnection {
         handle: &mut client::Handle<SshHandler>,
         username: &str,
         auth: &AuthMethod,
+        passphrase: Option<&str>,
     ) -> Result<client::AuthResult, Box<dyn std::error::Error + Send + Sync>> {
         let auth_result = match auth {
             AuthMethod::Password(pw) => handle.authenticate_password(username, pw).await?,
             AuthMethod::KeyFile(path) => {
                 let key_data = std::fs::read_to_string(path)?;
-                let key_pair = russh::keys::PrivateKey::from_openssh(&key_data)
-                    .map_err(|e| format!("Invalid key: {}", e))?;
+                // OpenSSH and PEM keys, encrypted or not.
+                let passphrase = passphrase.filter(|p| !p.is_empty());
+                let key_pair = russh::keys::decode_secret_key(&key_data, passphrase).map_err(|e| match e {
+                    russh::keys::Error::KeyIsEncrypted => {
+                        "This key is protected by a passphrase. Enter it in the passphrase field.".to_string()
+                    }
+                    other if passphrase.is_some() => {
+                        format!("Could not read the key. Is the passphrase correct? ({})", other)
+                    }
+                    other => format!("Invalid key: {}", other),
+                })?;
+                let hash_alg = Self::rsa_hash_for(handle, key_pair.algorithm().is_rsa()).await?;
                 handle
                     .authenticate_publickey(
                         username,
-                        PrivateKeyWithHashAlg::new(Arc::new(key_pair), None),
+                        PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg),
                     )
                     .await?
             }
@@ -171,8 +195,9 @@ impl SftpConnection {
                         russh::keys::agent::AgentIdentity::PublicKey { key, .. } => key.clone(),
                         russh::keys::agent::AgentIdentity::Certificate { .. } => continue,
                     };
+                    let hash_alg = Self::rsa_hash_for(handle, pubkey.algorithm().is_rsa()).await?;
                     if let Ok(result) = handle
-                        .authenticate_publickey_with(username, pubkey, None, &mut agent)
+                        .authenticate_publickey_with(username, pubkey, hash_alg, &mut agent)
                         .await
                         && result.success()
                     {
@@ -183,6 +208,18 @@ impl SftpConnection {
             }
         };
         Ok(auth_result)
+    }
+
+    /// RSA keys must sign with rsa-sha2-256/512: OpenSSH 8.8 and newer reject
+    /// the old SHA-1 "ssh-rsa" signature. Other key types ignore this.
+    async fn rsa_hash_for(
+        handle: &client::Handle<SshHandler>,
+        is_rsa: bool,
+    ) -> Result<Option<russh::keys::HashAlg>, Box<dyn std::error::Error + Send + Sync>> {
+        if !is_rsa {
+            return Ok(None);
+        }
+        Ok(handle.best_supported_rsa_hash().await?.flatten())
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, Box<dyn std::error::Error + Send + Sync>> {
@@ -415,4 +452,59 @@ pub struct TransferProgress {
     pub total_size: u64,
     #[allow(dead_code)]
     pub done: bool,
+}
+
+/// End-to-end checks against a real sshd. Ignored by default; run with
+/// `OPENSFTP_IT_DIR=<dir> OPENSFTP_IT_PORT=<port> cargo test -- --ignored it_`
+/// where <dir> holds `ed_plain` (ed25519, no passphrase) and `rsa_pw`
+/// (RSA, passphrase "test-pass"), both in the server's authorized_keys, and
+/// the server only accepts rsa-sha2-256/512 for RSA.
+#[cfg(test)]
+mod it {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn setup() -> (PathBuf, u16, String) {
+        let dir = PathBuf::from(std::env::var("OPENSFTP_IT_DIR").expect("OPENSFTP_IT_DIR"));
+        let port = std::env::var("OPENSFTP_IT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(2299);
+        let user = std::env::var("USER").unwrap_or_default();
+        (dir, port, user)
+    }
+
+    async fn try_key(key: &str, pass: Option<&str>) -> Result<SftpConnection, String> {
+        let (dir, port, user) = setup();
+        let auth = AuthMethod::KeyFile(dir.join(key));
+        let passphrases = KeyPassphrases { target: pass.map(String::from), jump: None };
+        SftpConnection::connect("127.0.0.1", port, &user, &auth, &passphrases)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn it_plain_ed25519_key() {
+        let conn = try_key("ed_plain", None).await.unwrap();
+        assert!(conn.list_dir(".").await.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn it_encrypted_rsa_key_needs_passphrase() {
+        let err = try_key("rsa_pw", None).await.err().expect("must fail without passphrase");
+        assert!(err.contains("passphrase"), "{err}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn it_encrypted_rsa_key_wrong_passphrase() {
+        let err = try_key("rsa_pw", Some("wrong")).await.err().expect("must fail with wrong passphrase");
+        assert!(err.contains("passphrase"), "{err}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn it_encrypted_rsa_key_with_sha2() {
+        let conn = try_key("rsa_pw", Some("test-pass")).await.unwrap();
+        assert!(conn.list_dir(".").await.is_ok());
+    }
 }

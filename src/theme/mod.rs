@@ -23,7 +23,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn settings_path() -> PathBuf {
-        let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let mut p = crate::core::config_dir();
         p.push("eurosftp");
         p.push("settings.json");
         p
