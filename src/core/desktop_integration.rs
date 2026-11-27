@@ -206,6 +206,12 @@ pub fn installed_binary_path() -> Option<PathBuf> {
 
 // ── Windows ──────────────────────────────────────────────────────────────────
 
+/// Path as a PowerShell single-quoted string body: a `'` inside is written as `''`.
+#[cfg(target_os = "windows")]
+fn ps_quote(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\'', "''")
+}
+
 #[cfg(target_os = "windows")]
 pub async fn install() -> Result<String, String> {
     let local_app = dirs::data_local_dir().ok_or("Cannot determine local app data directory")?;
@@ -247,13 +253,16 @@ pub async fn install() -> Result<String, String> {
          $sc.WorkingDirectory = '{}'; \
          $sc.Description = 'Modern SFTP Client'; \
          $sc.Save()",
-        shortcut_path.display(),
-        dest_bin.display(),
-        install_dir.display(),
+        ps_quote(&shortcut_path),
+        ps_quote(&dest_bin),
+        ps_quote(&install_dir),
     );
 
+    // CREATE_NO_WINDOW: the app has no console, so PowerShell would open its own window.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = tokio::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps_script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .await
         .map_err(|e| format!("Failed to create shortcut: {e}"))?;

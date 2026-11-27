@@ -36,3 +36,64 @@ jobs:
       - name: Clippy
         run: cargo clippy
         continue-on-error: true
+
+  # Start the release binary on a fresh machine and keep a screenshot.
+  # Catches "builds but does not start" (missing DLL, GPU init, console window).
+  smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release
+      - name: Start and screenshot
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath target\release\opensftp.exe -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { throw "opensftp.exe exited with code $($p.ExitCode)" }
+          $sub = [System.IO.File]::ReadAllBytes("target\release\opensftp.exe")
+          $pe = [BitConverter]::ToInt32($sub, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($sub, $pe + 24 + 68)
+          Write-Host "PE subsystem: $subsystem (2 = GUI, 3 = console)"
+          if ($subsystem -ne 2) { throw "release exe is not a GUI app" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("smoke-windows.png")
+          Stop-Process -Id $p.Id
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-windows
+          path: smoke-windows.png
+
+  smoke-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libwayland-dev libvulkan-dev mesa-vulkan-drivers libgl1-mesa-dri \
+            xvfb x11-apps imagemagick
+      - name: Build release
+        run: cargo build --release
+      - name: Start and screenshot
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 &
+          sleep 2
+          export DISPLAY=:99
+          ./target/release/opensftp &
+          PID=$!
+          sleep 20
+          kill -0 $PID || { echo "opensftp exited early"; exit 1; }
+          xwd -root -silent | convert xwd:- smoke-linux.png
+          kill $PID
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-linux
+          path: smoke-linux.png
