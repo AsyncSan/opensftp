@@ -19,6 +19,9 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: opensftp-linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: opensftp-linux-aarch64
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: opensftp-macos-aarch64
@@ -101,11 +104,12 @@ jobs:
 
             | Platform | File | Notes |
             |----------|------|-------|
-            | Linux | `opensftp-linux-x86_64` | Standalone binary, `chmod +x` and run |
+            | Linux (x86_64) | `opensftp-linux-x86_64` | Standalone binary, `chmod +x` and run |
+            | Linux (ARM64) | `opensftp-linux-aarch64` | Standalone binary, `chmod +x` and run |
             | macOS (Apple Silicon) | `opensftp-macos-aarch64` | M1/M2/M3/M4, `chmod +x` and run |
             | Windows | `opensftp-windows-x86_64.exe` | Double-click to run |
 
-            Intel Macs: use the universal `.app` bundle from the 0.1.0 release, or build from source.
+            Intel Macs: the universal `.app` bundle (`OpenSFTP-<version>-macOS.zip`) is built with `build-release.sh` and attached to the release by hand.
             The macOS builds are not code-signed — right-click the app and choose **Open** on first launch.
 
             ### Getting started

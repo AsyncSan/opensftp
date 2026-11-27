@@ -19,12 +19,12 @@ Pre-built binaries. No installation required.
 | Windows | [opensftp-windows-x86_64.exe](https://github.com/AsyncSan/opensftp/releases/latest) | Standalone `.exe`. Not signed, so SmartScreen may warn on first run. |
 | Linux (x86_64) | [opensftp-linux-x86_64](https://github.com/AsyncSan/opensftp/releases/latest) | `chmod +x opensftp-linux-x86_64 && ./opensftp-linux-x86_64` |
 | macOS (Apple Silicon) | [opensftp-macos-aarch64](https://github.com/AsyncSan/opensftp/releases/latest) | `chmod +x opensftp-macos-aarch64 && ./opensftp-macos-aarch64` |
-| macOS (`.app` bundle) | [OpenSFTP-0.1.0-macOS.zip](https://github.com/AsyncSan/opensftp/releases/tag/v0.1.0) | Universal (Intel + Apple Silicon), still at 0.1.0. Not code-signed — right-click the app and choose **Open** on first launch. |
-| Linux (ARM64) | [OpenSFTP-0.1.0-linux-aarch64.tar.gz](https://github.com/AsyncSan/opensftp/releases/tag/v0.1.0) | Still at 0.1.0. `tar xzf OpenSFTP-*.tar.gz && ./opensftp` |
+| macOS (`.app` bundle) | [OpenSFTP-0.2.0-macOS.zip](https://github.com/AsyncSan/opensftp/releases/latest) | Universal (Intel + Apple Silicon). Not code-signed — right-click the app and choose **Open** on first launch. |
+| Linux (ARM64) | [opensftp-linux-aarch64](https://github.com/AsyncSan/opensftp/releases/latest) | `chmod +x opensftp-linux-aarch64 && ./opensftp-linux-aarch64` |
 
 On first launch, the app asks whether you want to run it **portable** (just the binary) or **install it** to your system (adds to Applications/Start Menu/Dock). You can change this anytime in Settings.
 
-All releases: [github.com/AsyncSan/opensftp/releases](https://github.com/AsyncSan/opensftp/releases)
+All releases: [github.com/AsyncSan/opensftp/releases](https://github.com/AsyncSan/opensftp/releases). The same files, with SHA-256 checksums, are also on [renemurrell.de/software/opensftp](https://renemurrell.de/software/opensftp/#download).
 
 ---
 
