@@ -110,7 +110,7 @@ jobs:
             | Windows | `opensftp-windows-x86_64.exe` | Double-click to run |
 
             Intel Macs: the universal `.app` bundle (`OpenSFTP-<version>-macOS.zip`) is built with `build-release.sh` and attached to the release by hand.
-            The macOS builds are not code-signed — right-click the app and choose **Open** on first launch.
+            The macOS builds are not notarized. macOS blocks the first start; allow it once under System Settings → Privacy & Security → **Open Anyway**.
 
             ### Getting started
             Download the binary for your platform, make it executable (`chmod +x` on macOS/Linux), and run it. No installation required.
