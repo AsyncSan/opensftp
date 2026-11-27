@@ -22,7 +22,7 @@ jobs:
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: opensftp-linux-aarch64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: opensftp-macos-aarch64
           # macos-13 (Intel) is omitted: those runners now sit in the queue for
